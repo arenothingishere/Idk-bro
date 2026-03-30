@@ -1,16 +1,10 @@
--- =====================================================================
--- TAS 緊湊型控制面板 (修復拖動 & 精緻字體版)
--- =====================================================================
-
 local CoreGui = game:GetService("Players").LocalPlayer:WaitForChild("PlayerGui")
 local UserInputService = game:GetService("UserInputService")
 local RunService = game:GetService("RunService")
 
--- =====================================================================
--- ▼▼▼ 模塊代碼插槽 (MODULE SLOT) ▼▼▼
--- =====================================================================
+-- ▼ 模塊插槽: 將 HumanoidAnimRecorder.txt 完整代碼貼於此處 ▼
 local function LoadTASModule()
-	--!strict
+--!strict
 -- ModuleScript: HumanoidAnimRecorder
 -- Purpose:
 --   Rebuild Roblox's classic R6 Animate LocalScript logic in a module form,
@@ -2869,13 +2863,11 @@ local singleton = Recorder.new()
 singleton:_setState("idle")
 return singleton
 
-
-
 end
+-- ▲ 插槽結束 ▲
 
 local TAS_API = LoadTASModule()
 if not TAS_API then
-	warn("[TAS UI] 模塊尚未載入，請確認是否已將代碼貼入『模塊代碼插槽』中！")
 	TAS_API = { 
 		Status = "未載入", 
 		Record = function() end, Stop = function() end, Resume = function() end,
@@ -2883,14 +2875,6 @@ if not TAS_API then
 		goBack = function() end, goFront = function() end
 	}
 end
--- =====================================================================
--- ▲▲▲ 模塊代碼插槽 (MODULE SLOT) ▲▲▲
--- =====================================================================
-
-
--- =====================================================================
--- 介面生成邏輯 (GUI Creation)
--- =====================================================================
 
 local ScreenGui = Instance.new("ScreenGui")
 ScreenGui.Name = "TAS_Compact_Gui"
@@ -2898,37 +2882,31 @@ ScreenGui.ResetOnSpawn = false
 ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 ScreenGui.Parent = CoreGui
 
--- 1. 主框架 (稍微壓縮高度讓整體更緊湊)
 local MainFrame = Instance.new("Frame")
 MainFrame.Name = "MainFrame"
-MainFrame.Size = UDim2.new(0, 230, 0, 160) -- 高度從 175 降到 160
+MainFrame.Size = UDim2.new(0, 230, 0, 160)
 MainFrame.Position = UDim2.new(0.5, 0, 0.8, 0)
 MainFrame.AnchorPoint = Vector2.new(0.5, 0.5)
 MainFrame.BackgroundColor3 = Color3.fromRGB(28, 28, 33)
 MainFrame.BorderSizePixel = 0
-MainFrame.Active = true -- 確保攔截滑鼠點擊
+MainFrame.Active = true
 MainFrame.Parent = ScreenGui
 
-local UICorner = Instance.new("UICorner")
-UICorner.CornerRadius = UDim.new(0, 8)
-UICorner.Parent = MainFrame
+Instance.new("UICorner", MainFrame).CornerRadius = UDim.new(0, 8)
 
 local UIStroke = Instance.new("UIStroke")
 UIStroke.Color = Color3.fromRGB(60, 60, 75)
 UIStroke.Thickness = 2
 UIStroke.Parent = MainFrame
 
--- 2. 拖動標題條 (Top Bar)
 local TopBar = Instance.new("Frame")
 TopBar.Size = UDim2.new(1, 0, 0, 25)
 TopBar.BackgroundColor3 = Color3.fromRGB(40, 40, 48)
 TopBar.BorderSizePixel = 0
-TopBar.Active = true -- 確保可以抓取拖動
+TopBar.Active = true
 TopBar.Parent = MainFrame
 
-local TopBarCorner = Instance.new("UICorner")
-TopBarCorner.CornerRadius = UDim.new(0, 8)
-TopBarCorner.Parent = TopBar
+Instance.new("UICorner", TopBar).CornerRadius = UDim.new(0, 8)
 
 local BottomBlocker = Instance.new("Frame")
 BottomBlocker.Size = UDim2.new(1, 0, 0, 5)
@@ -2938,28 +2916,35 @@ BottomBlocker.BorderSizePixel = 0
 BottomBlocker.Parent = TopBar
 
 local Title = Instance.new("TextLabel")
-Title.Size = UDim2.new(0, 100, 1, 0)
+Title.Size = UDim2.new(0, 80, 1, 0)
 Title.Position = UDim2.new(0, 8, 0, 0)
 Title.BackgroundTransparency = 1
 Title.Text = "🏃 TAS"
 Title.TextColor3 = Color3.fromRGB(200, 200, 200)
 Title.Font = Enum.Font.GothamBold
-Title.TextSize = 11 -- 縮小標題字體
+Title.TextSize = 11
 Title.TextXAlignment = Enum.TextXAlignment.Left
 Title.Parent = TopBar
 
 local StatusLabel = Instance.new("TextLabel")
 StatusLabel.Size = UDim2.new(0, 100, 1, 0)
-StatusLabel.Position = UDim2.new(1, -108, 0, 0)
+StatusLabel.Position = UDim2.new(1, -130, 0, 0)
 StatusLabel.BackgroundTransparency = 1
 StatusLabel.Text = "🟢 待機"
 StatusLabel.TextColor3 = Color3.fromRGB(150, 255, 150)
 StatusLabel.Font = Enum.Font.GothamSemibold
-StatusLabel.TextSize = 11 -- 縮小狀態字體
+StatusLabel.TextSize = 11
 StatusLabel.TextXAlignment = Enum.TextXAlignment.Right
 StatusLabel.Parent = TopBar
 
--- 3. 內容容器
+local LockBtn = Instance.new("TextButton")
+LockBtn.Size = UDim2.new(0, 25, 1, 0)
+LockBtn.Position = UDim2.new(1, -25, 0, 0)
+LockBtn.BackgroundTransparency = 1
+LockBtn.Text = "🔓"
+LockBtn.TextSize = 14
+LockBtn.Parent = TopBar
+
 local Content = Instance.new("Frame")
 Content.Size = UDim2.new(1, -16, 1, -35)
 Content.Position = UDim2.new(0, 8, 0, 30)
@@ -2972,36 +2957,22 @@ VLayout.SortOrder = Enum.SortOrder.LayoutOrder
 VLayout.Padding = UDim.new(0, 6)
 VLayout.Parent = Content
 
--- =====================================================================
--- 排版層級
--- =====================================================================
-
---[輔助函數] 建立按鈕
 local function CreateBtn(parent, text, color, fontSize, cornerRadius)
 	local Btn = Instance.new("TextButton")
 	Btn.Text = text
 	Btn.BackgroundColor3 = color
 	Btn.TextColor3 = Color3.fromRGB(255, 255, 255)
 	Btn.Font = Enum.Font.GothamBold
-	Btn.TextScaled = false -- 關閉自動縮放，確保字體大小一致
-	Btn.TextSize = fontSize or 11 -- 預設使用 11 號小字體
+	Btn.TextScaled = false
+	Btn.TextSize = fontSize or 11
 	Btn.AutoButtonColor = true
 	Btn.Parent = parent
 	
-	local Corner = Instance.new("UICorner")
-	Corner.CornerRadius = UDim.new(0, cornerRadius or 6)
-	Corner.Parent = Btn
+	Instance.new("UICorner", Btn).CornerRadius = UDim.new(0, cornerRadius or 6)
 	
-	-- 點擊特效
-	Btn.MouseButton1Down:Connect(function()
-		Btn.BackgroundTransparency = 0.2
-	end)
-	Btn.MouseButton1Up:Connect(function()
-		Btn.BackgroundTransparency = 0
-	end)
-	Btn.MouseLeave:Connect(function()
-		Btn.BackgroundTransparency = 0
-	end)
+	Btn.MouseButton1Down:Connect(function() Btn.BackgroundTransparency = 0.2 end)
+	Btn.MouseButton1Up:Connect(function() Btn.BackgroundTransparency = 0 end)
+	Btn.MouseLeave:Connect(function() Btn.BackgroundTransparency = 0 end)
 	
 	return Btn
 end
@@ -3009,9 +2980,8 @@ end
 local colorDark = Color3.fromRGB(50, 50, 60)
 local colorSeek = Color3.fromRGB(45, 60, 80)
 
--- === Row 1: 倒轉快捷 (上層) ===
 local Row1 = Instance.new("Frame")
-Row1.Size = UDim2.new(1, 0, 0, 24) -- 高度 24px
+Row1.Size = UDim2.new(1, 0, 0, 24)
 Row1.BackgroundTransparency = 1
 Row1.LayoutOrder = 1
 Row1.Parent = Content
@@ -3027,19 +2997,17 @@ local BtnM1  = CreateBtn(Row1, "◀ -1", colorSeek, 11)  BtnM1.Size = UDim2.new(
 local BtnP1  = CreateBtn(Row1, "▶ +1", colorSeek, 11)  BtnP1.Size = UDim2.new(0.25, -5, 1, 0)
 local BtnP60 = CreateBtn(Row1, "⏩ +60", colorSeek, 11) BtnP60.Size = UDim2.new(0.25, -4, 1, 0)
 
--- === Row 2: 主動態按鈕 (中層) ===
 local Row2 = Instance.new("Frame")
-Row2.Size = UDim2.new(1, 0, 0, 42) -- 高度 42px
+Row2.Size = UDim2.new(1, 0, 0, 42)
 Row2.BackgroundTransparency = 1
 Row2.LayoutOrder = 2
 Row2.Parent = Content
 
-local ActionBtn = CreateBtn(Row2, "🔴 開始錄製", Color3.fromRGB(180, 50, 50), 14, 8) -- 主按鈕字體 14
+local ActionBtn = CreateBtn(Row2, "🔴 開始錄製", Color3.fromRGB(180, 50, 50), 14, 8)
 ActionBtn.Size = UDim2.new(1, 0, 1, 0)
 
--- === Row 3: 輔助按鈕 (下層) ===
 local Row3 = Instance.new("Frame")
-Row3.Size = UDim2.new(1, 0, 0, 26) -- 高度 26px
+Row3.Size = UDim2.new(1, 0, 0, 26)
 Row3.BackgroundTransparency = 1
 Row3.LayoutOrder = 3
 Row3.Parent = Content
@@ -3053,10 +3021,6 @@ HLayout3.Parent = Row3
 local PlayBtn  = CreateBtn(Row3, "▶️ 回放", Color3.fromRGB(50, 130, 80), 11) PlayBtn.Size = UDim2.new(0.33, -4, 1, 0)
 local SaveBtn  = CreateBtn(Row3, "💾 保存", colorDark, 11) SaveBtn.Size = UDim2.new(0.33, -4, 1, 0)
 local ResetBtn = CreateBtn(Row3, "🔄 重置", colorDark, 11) ResetBtn.Size = UDim2.new(0.33, -4, 1, 0)
-
--- =====================================================================
--- API 綁定邏輯
--- =====================================================================
 
 BtnM60.MouseButton1Click:Connect(function() TAS_API:goBack(60) end)
 BtnM1.MouseButton1Click:Connect(function() TAS_API:goBack(1) end)
@@ -3080,9 +3044,6 @@ ActionBtn.MouseButton1Click:Connect(function()
 	end
 end)
 
--- =====================================================================
--- 狀態更新循環
--- =====================================================================
 local statusTexts = {
 	idle = "🟢 待機",
 	recording = "🔴 錄製中",
@@ -3114,15 +3075,18 @@ task.spawn(function()
 	end
 end)
 
--- =====================================================================
--- 完美拖動邏輯 (Robust Dragging)
--- 改用 UserInputService 全局監聽，防止滑鼠甩太快導致拖動丟失
--- =====================================================================
+local isLocked = false
+LockBtn.MouseButton1Click:Connect(function()
+	isLocked = not isLocked
+	LockBtn.Text = isLocked and "🔒" or "🔓"
+end)
+
 local dragging = false
 local dragStart = nil
 local startPos = nil
 
 TopBar.InputBegan:Connect(function(input)
+	if isLocked then return end
 	if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
 		dragging = true
 		dragStart = input.Position
@@ -3131,11 +3095,9 @@ TopBar.InputBegan:Connect(function(input)
 end)
 
 UserInputService.InputChanged:Connect(function(input)
-	-- 如果正在拖動，且滑鼠或手指正在移動
-	if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+	if dragging and not isLocked and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
 		if dragStart and startPos then
 			local delta = input.Position - dragStart
-			-- 更新 MainFrame 的位置
 			MainFrame.Position = UDim2.new(
 				startPos.X.Scale, 
 				startPos.X.Offset + delta.X, 
@@ -3147,10 +3109,7 @@ UserInputService.InputChanged:Connect(function(input)
 end)
 
 UserInputService.InputEnded:Connect(function(input)
-	-- 當放開滑鼠左鍵或手指離開螢幕時，停止拖動
 	if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
 		dragging = false
 	end
 end)
-
-print("[TAS GUI] 緊湊型面板 (修復拖動+字體版) 初始化完成！")
