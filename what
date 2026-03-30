@@ -697,24 +697,12 @@ function Recorder:_setAnimationSpeed(speed: number, silent: boolean?)
 	end
 end
 
-
-function Recorder:_playTrack(track: AnimationTrack, transitionTime: number, startPaused: boolean?)
-	local initialSpeed = if startPaused then 0 else 1
-	track:Play(transitionTime, 1, initialSpeed)
-	if startPaused then
-		pcall(function()
-			track:AdjustSpeed(0)
-		end)
-	end
-end
-
 function Recorder:_playAnimation(
 	animName: string,
 	transitionTime: number,
 	humanoid: Humanoid,
 	forcedAnimId: string?,
-	silent: boolean?,
-	startPaused: boolean?
+	silent: boolean?
 ): (AnimationTrack?, boolean)
 	local selected, pool = self:_chooseAnimation(animName, forcedAnimId)
 	if not selected or not selected.anim then
@@ -748,7 +736,7 @@ function Recorder:_playAnimation(
 
 		self._currentAnimTrack = humanoid:LoadAnimation(anim)
 		self._currentAnimTrack.Priority = Enum.AnimationPriority.Core
-		self:_playTrack(self._currentAnimTrack, transitionTime, startPaused)
+		self._currentAnimTrack:Play(transitionTime)
 
 		self._currentAnim = animName
 		self._currentAnimInstance = anim
@@ -784,8 +772,7 @@ function Recorder:_playToolAnimation(
 	humanoid: Humanoid,
 	priority: Enum.AnimationPriority?,
 	forcedAnimId: string?,
-	silent: boolean?,
-	startPaused: boolean?
+	silent: boolean?
 ): (AnimationTrack?, boolean)
 	local selected, pool = self:_chooseAnimation(animName, forcedAnimId)
 	if not selected or not selected.anim then
@@ -822,7 +809,7 @@ function Recorder:_playToolAnimation(
 		if priority then
 			self._toolAnimTrack.Priority = priority
 		end
-		self:_playTrack(self._toolAnimTrack, transitionTime, startPaused)
+		self._toolAnimTrack:Play(transitionTime)
 
 		self._currentToolAnimName = animName
 		self._toolAnimInstance = anim
@@ -1212,7 +1199,7 @@ function Recorder:_updateStopPhysicsTarget(targetCFrame: CFrame)
 	local targetRootPartCFrame = self:_pivotToRootPartCFrame(targetCFrame)
 	mover.alignPosition.Position = targetRootPartCFrame.Position
 	mover.alignOrientation.CFrame = targetRootPartCFrame.Rotation
-	mover.vectorForce.Force = Vector3.zero
+	mover.vectorForce.Force = Vector3.new(0, rootPart.AssemblyMass * Workspace.Gravity, 0)
 end
 
 function Recorder:_disableStopPhysics(restoreVelocity: boolean?)
@@ -1301,7 +1288,7 @@ function Recorder:_enableStopPhysics(initialCFrame: CFrame?)
 	vectorForce.Attachment0 = attachment
 	vectorForce.RelativeTo = Enum.ActuatorRelativeTo.World
 	vectorForce.ApplyAtCenterOfMass = true
-	vectorForce.Force = Vector3.zero
+	vectorForce.Force = Vector3.new(0, rootPart.AssemblyMass * Workspace.Gravity, 0)
 	vectorForce.Parent = rootPart
 
 	local restoreEvaluateStateMachine = humanoid.EvaluateStateMachine
@@ -1384,10 +1371,9 @@ function Recorder:_applyStopPreview(targetTime: number): boolean
 		elseif kind == "playAnimation" then
 			local track = self:_playAnimation(
 				ev.animName or "idle",
-				0,
+				tonumber(ev.transitionTime) or 0,
 				self._humanoid :: Humanoid,
 				ev.animId,
-				true,
 				true
 			)
 			mainState.track = track
@@ -1405,23 +1391,22 @@ function Recorder:_applyStopPreview(targetTime: number): boolean
 			if ev.target == "main" then
 				advanceState(mainState, evTime)
 				mainState.speed = tonumber(ev.value) or 1
-				self._currentAnimSpeed = mainState.speed
+				self:_setAnimationSpeed(mainState.speed, true)
 			end
 
 		elseif kind == "stopAnimation" then
 			advanceState(mainState, evTime)
-			self:_stopAllAnimations(true, 0)
+			self:_stopAllAnimations(true, tonumber(ev.transitionTime) or 0)
 			mainState.track = nil
 
 		elseif kind == "playToolAnimation" then
 			self._toolAnimSignal = ev.signal or self._toolAnimSignal
 			local track = self:_playToolAnimation(
 				ev.animName or "toolnone",
-				0,
+				tonumber(ev.transitionTime) or 0,
 				self._humanoid :: Humanoid,
 				self:_parsePriority(ev.priority),
 				ev.animId,
-				true,
 				true
 			)
 			toolState.track = track
@@ -1715,7 +1700,7 @@ function Recorder:_enablePlaybackPhysics(initialCFrame: CFrame?)
 	vectorForce.Attachment0 = attachment
 	vectorForce.RelativeTo = Enum.ActuatorRelativeTo.World
 	vectorForce.ApplyAtCenterOfMass = true
-	vectorForce.Force = Vector3.zero
+	vectorForce.Force = Vector3.new(0, rootPart.AssemblyMass * Workspace.Gravity, 0)
 	vectorForce.Parent = rootPart
 
 	local restoreEvaluateStateMachine = humanoid.EvaluateStateMachine
@@ -1806,7 +1791,7 @@ function Recorder:_applyPlaybackRootMotion(targetCFrame: CFrame)
 	local targetRootPartCFrame = self:_pivotToRootPartCFrame(targetCFrame)
 	mover.alignPosition.Position = targetRootPartCFrame.Position
 	mover.alignOrientation.CFrame = targetRootPartCFrame.Rotation
-	mover.vectorForce.Force = Vector3.zero
+	mover.vectorForce.Force = Vector3.new(0, rootPart.AssemblyMass * Workspace.Gravity, 0)
 end
 
 function Recorder:_onRunning(speed: number)
@@ -3022,10 +3007,36 @@ local PlayBtn  = CreateBtn(Row3, "▶️ 回放", Color3.fromRGB(50, 130, 80), 1
 local SaveBtn  = CreateBtn(Row3, "💾 保存", colorDark, 11) SaveBtn.Size = UDim2.new(0.33, -4, 1, 0)
 local ResetBtn = CreateBtn(Row3, "🔄 重置", colorDark, 11) ResetBtn.Size = UDim2.new(0.33, -4, 1, 0)
 
-BtnM60.MouseButton1Click:Connect(function() TAS_API:goBack(60) end)
-BtnM1.MouseButton1Click:Connect(function() TAS_API:goBack(1) end)
-BtnP1.MouseButton1Click:Connect(function() TAS_API:goFront(1) end)
-BtnP60.MouseButton1Click:Connect(function() TAS_API:goFront(60) end)
+-- ▼ 長按連發邏輯 ▼
+local function BindHoldRepeat(btn, actionFunc)
+	local isHolding = false
+	btn.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			isHolding = true
+			actionFunc()
+			task.spawn(function()
+				task.wait(0.3) -- 首次點擊與連續觸發間的延遲
+				while isHolding do
+					actionFunc()
+					task.wait(0.05) -- 連發速度
+				end
+			end)
+		end
+	end)
+	local function stopHold(input)
+		if not input or input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			isHolding = false
+		end
+	end
+	btn.InputEnded:Connect(stopHold)
+	btn.MouseLeave:Connect(stopHold)
+end
+
+BindHoldRepeat(BtnM60, function() TAS_API:goBack(60) end)
+BindHoldRepeat(BtnM1, function() TAS_API:goBack(1) end)
+BindHoldRepeat(BtnP1, function() TAS_API:goFront(1) end)
+BindHoldRepeat(BtnP60, function() TAS_API:goFront(60) end)
+-- ▲ 長按連發邏輯結束 ▲
 
 PlayBtn.MouseButton1Click:Connect(function() TAS_API:Play() end)
 SaveBtn.MouseButton1Click:Connect(function() TAS_API:Save() end)
