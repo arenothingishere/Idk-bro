@@ -377,6 +377,7 @@ function Recorder.new()
 	self._stopStoredAngularVelocity = Vector3.zero
 	self._stopStoredMainSpeed = 1.0
 	self._stopStoredToolSpeed = 1.0
+	self._stopSeekToken = 0
 
 	return self
 end
@@ -895,6 +896,66 @@ function Recorder:_pivotToRootPartCFrame(targetPivot: CFrame): CFrame
 	return targetPivot * getPivotOffsetInverse(self._rootPart)
 end
 
+function Recorder:_applyImmediateRootMotion(targetPivot: CFrame, zeroVelocity: boolean?)
+	local rootPart = self._rootPart
+	if rootPart and rootPart.Parent then
+		rootPart:PivotTo(targetPivot)
+		if zeroVelocity then
+			rootPart.AssemblyLinearVelocity = Vector3.zero
+			rootPart.AssemblyAngularVelocity = Vector3.zero
+		end
+		return
+	end
+
+	local character = self._character
+	if character and character.Parent then
+		character:PivotTo(targetPivot)
+	end
+end
+
+function Recorder:_estimateRootMotionVelocityAtTime(rootMotionEvents: { any }, elapsed: number): (Vector3, Vector3)
+	local count = #rootMotionEvents
+	if count <= 1 then
+		return Vector3.zero, Vector3.zero
+	end
+
+	local prevIndex = 1
+	while prevIndex < count and elapsed > (tonumber(rootMotionEvents[prevIndex + 1].t) or 0) do
+		prevIndex += 1
+	end
+
+	local nextIndex = math.clamp(prevIndex + 1, 1, count)
+	if nextIndex == prevIndex then
+		prevIndex = math.max(prevIndex - 1, 1)
+	end
+
+	local prevFrame = rootMotionEvents[prevIndex]
+	local nextFrame = rootMotionEvents[nextIndex]
+	if not prevFrame or not nextFrame or prevFrame == nextFrame then
+		return Vector3.zero, Vector3.zero
+	end
+
+	local prevTime = tonumber(prevFrame.t) or 0
+	local nextTime = tonumber(nextFrame.t) or prevTime
+	local dt = nextTime - prevTime
+	if dt <= 0 then
+		return Vector3.zero, Vector3.zero
+	end
+
+	local prevCFrame = decodeCFrame(prevFrame)
+	local nextCFrame = decodeCFrame(nextFrame)
+	local linearVelocity = (nextCFrame.Position - prevCFrame.Position) / dt
+
+	local delta = prevCFrame:ToObjectSpace(nextCFrame)
+	local axis, angle = delta:ToAxisAngle()
+	local angularVelocity = Vector3.zero
+	if axis.Magnitude > 0 and math.abs(angle) > 0.000001 then
+		angularVelocity = axis * (angle / dt)
+	end
+
+	return linearVelocity, angularVelocity
+end
+
 function Recorder:_hasRootMotionChanged(rootCf: CFrame, force: boolean?): boolean
 	if force or not self._lastRecordedRootCFrame then
 		return true
@@ -997,6 +1058,22 @@ function Recorder:_seekTrackPosition(track: AnimationTrack?, position: number, a
 
 	pcall(function()
 		track.TimePosition = targetPosition
+	end)
+end
+
+function Recorder:_seekTrackPositionDeferred(track: AnimationTrack?, position: number, allowLoop: boolean?, token: number)
+	if not track then
+		return
+	end
+
+	task.defer(function()
+		if self._stopSeekToken ~= token or not self._stopActive then
+			return
+		end
+		self:_seekTrackPosition(track, position, allowLoop)
+		pcall(function()
+			track:AdjustSpeed(0)
+		end)
 	end)
 end
 
@@ -1219,6 +1296,9 @@ function Recorder:_applyStopPreview(targetTime: number): boolean
 	local sessionEndTime = self:_getSessionEndTime(self._live)
 	targetTime = math.clamp(targetTime, 0, sessionEndTime)
 
+	self._stopSeekToken += 1
+	local stopSeekToken = self._stopSeekToken
+
 	self:_stopAllAnimations(true, 0)
 	self:_stopToolAnimations(true)
 	self._toolAnimSignal = "None"
@@ -1275,7 +1355,11 @@ function Recorder:_applyStopPreview(targetTime: number): boolean
 			mainState.position = 0
 			mainState.lastTime = evTime
 			mainState.allowLoop = ev.looped == true
-			self:_setAnimationSpeed(mainState.speed, true)
+			if track then
+				pcall(function()
+					track:AdjustSpeed(0)
+				end)
+			end
 
 		elseif kind == "speed" then
 			if ev.target == "main" then
@@ -1304,7 +1388,11 @@ function Recorder:_applyStopPreview(targetTime: number): boolean
 			toolState.position = 0
 			toolState.lastTime = evTime
 			toolState.allowLoop = false
-			self:_setToolAnimationSpeed(toolState.speed)
+			if track then
+				pcall(function()
+					track:AdjustSpeed(0)
+				end)
+			end
 
 		elseif kind == "stopToolAnimation" then
 			advanceState(toolState, evTime)
@@ -1321,13 +1409,16 @@ function Recorder:_applyStopPreview(targetTime: number): boolean
 
 	if mainState.track then
 		self:_seekTrackPosition(mainState.track, mainState.position, mainState.allowLoop)
+		self:_seekTrackPositionDeferred(mainState.track, mainState.position, mainState.allowLoop, stopSeekToken)
 	end
 	if toolState.track then
 		self:_seekTrackPosition(toolState.track, toolState.position, toolState.allowLoop)
+		self:_seekTrackPositionDeferred(toolState.track, toolState.position, toolState.allowLoop, stopSeekToken)
 	end
 
 	self._stopStoredMainSpeed = mainState.track and mainState.speed or self._currentAnimSpeed
 	self._stopStoredToolSpeed = toolState.track and toolState.speed or self:_getTrackSpeed(self._toolAnimTrack)
+	self._currentAnimSpeed = self._stopStoredMainSpeed
 
 	if self._currentAnimTrack then
 		self._currentAnimTrack:AdjustSpeed(0)
@@ -1338,15 +1429,14 @@ function Recorder:_applyStopPreview(targetTime: number): boolean
 
 	local sampledRoot, rootFrame = self:_sampleRootMotionAtTime(rootMotionEvents, targetTime)
 	if sampledRoot then
-		if self._character then
-			self._character:PivotTo(sampledRoot)
-		elseif self._rootPart then
-			self._rootPart:PivotTo(self:_pivotToRootPartCFrame(sampledRoot))
-		end
+		self:_applyImmediateRootMotion(sampledRoot, true)
 		self:_updateStopPhysicsTarget(sampledRoot)
 		self._lastRecordedRootCFrame = sampledRoot
+		self._stopStoredLinearVelocity, self._stopStoredAngularVelocity = self:_estimateRootMotionVelocityAtTime(rootMotionEvents, targetTime)
 		self._stopPreviewFrame = math.max(rootFrame, 1)
 	else
+		self._stopStoredLinearVelocity = Vector3.zero
+		self._stopStoredAngularVelocity = Vector3.zero
 		self._stopPreviewFrame = 1
 	end
 
@@ -1362,6 +1452,9 @@ function Recorder:_enterStopMode()
 
 	local currentTime = math.max(0, os.clock() - self._recordStartClock)
 	self:_recordRootMotion(true)
+	if self._live then
+		currentTime = math.max(currentTime, self:_getSessionEndTime(self._live))
+	end
 	self:_pushTrace("stop_enabled", {
 		frame = self._stopPreviewFrame,
 		t = currentTime,
@@ -2204,6 +2297,7 @@ function Recorder:_bindCharacter(character: Model)
 	self._stopPreviewFrame = 1
 	self._stopPreviewTime = 0
 	self._stopResumeTruncateTime = nil
+	self._stopSeekToken = 0
 
 	if self._humanoid then
 		self:_playAnimation("idle", 0.1, self._humanoid)
@@ -2327,10 +2421,12 @@ function Recorder:_clearSessionData()
 	self._stopPreviewFrame = 1
 	self._stopPreviewTime = 0
 	self._stopResumeTruncateTime = nil
+	self._stopSeekToken = 0
 	self._stopStoredLinearVelocity = Vector3.zero
 	self._stopStoredAngularVelocity = Vector3.zero
 	self._stopStoredMainSpeed = 1.0
 	self._stopStoredToolSpeed = 1.0
+	self._stopSeekToken = 0
 end
 
 function Recorder:Record()
@@ -2377,6 +2473,7 @@ function Recorder:Record()
 	self._stopPreviewFrame = 1
 	self._stopPreviewTime = 0
 	self._stopResumeTruncateTime = nil
+	self._stopSeekToken = 0
 
 	self:_pushEvent("session_start", {
 		initialPose = self._pose,
@@ -2541,11 +2638,7 @@ function Recorder:Play(savedString: string?)
 		self:_stopToolAnimations(true)
 
 		if initialRootCFrame then
-			if self._character then
-				self._character:PivotTo(initialRootCFrame)
-			elseif self._rootPart then
-				self._rootPart:PivotTo(initialRootCFrame)
-			end
+			self:_applyImmediateRootMotion(initialRootCFrame, true)
 
 			self:_enablePlaybackPhysics(initialRootCFrame)
 			self:_applyPlaybackRootMotion(initialRootCFrame)
