@@ -15,6 +15,7 @@ local RecorderModule = (function()
 	
 	-- ▼▼▼▼▼ 請將你的模塊代碼完整貼在下方 ▼▼▼▼▼
 	
+	-- (在這裡貼上包含 --!strict 一直到 return singleton 的完整代碼)
 	--!strict
 -- ModuleScript: HumanoidAnimRecorder
 -- Purpose:
@@ -26,7 +27,8 @@ local RecorderModule = (function()
 --
 -- Public API:
 --   Recorder:Record()
---   Recorder:Stop()
+--   Recorder:Stop()          -- enter stop-preview / stop playback (idempotent while already preview-stopped)
+--   Recorder:Resume()        -- resume recording from stop-preview
 --   Recorder:Save()
 --   Recorder:Play(savedString?)
 --   Recorder:goBack(frameCount)
@@ -378,8 +380,44 @@ function Recorder.new()
 	self._stopStoredMainSpeed = 1.0
 	self._stopStoredToolSpeed = 1.0
 	self._stopSeekToken = 0
+	self._apiBusy = false
+	self._apiBusyName = ""
 
 	return self
+end
+
+function Recorder:_beginAtomicAction(actionName: string): (boolean, string?)
+	if self._apiBusy then
+		return false, if self._apiBusyName ~= "" then ("busy_" .. self._apiBusyName) else "busy"
+	end
+
+	self._apiBusy = true
+	self._apiBusyName = actionName
+	return true, nil
+end
+
+function Recorder:_endAtomicAction(actionName: string?)
+	if actionName == nil or self._apiBusyName == actionName then
+		self._apiBusy = false
+		self._apiBusyName = ""
+	end
+end
+
+function Recorder:_runAtomicAction(actionName: string, callback)
+	local ok, reason = self:_beginAtomicAction(actionName)
+	if not ok then
+		return false, reason
+	end
+
+	local success, resultA, resultB, resultC = pcall(callback)
+	self:_endAtomicAction(actionName)
+
+	if not success then
+		warn("[HumanoidAnimRecorder] action failed:", actionName, resultA)
+		return false, "internal_error"
+	end
+
+	return resultA, resultB, resultC
 end
 
 function Recorder:_isRuntimeSuppressed(): boolean
@@ -1449,6 +1487,9 @@ function Recorder:_enterStopMode()
 	if self._state ~= "recording" or not self._live then
 		return false, "not_recording"
 	end
+	if self._stopActive then
+		return false, "already_stopped"
+	end
 
 	local currentTime = math.max(0, os.clock() - self._recordStartClock)
 	self:_recordRootMotion(true)
@@ -1462,7 +1503,10 @@ function Recorder:_enterStopMode()
 
 	local currentRoot = self:_getRootMotionCFrame()
 	if currentRoot then
-		self:_enableStopPhysics(currentRoot)
+		local enabled = self:_enableStopPhysics(currentRoot)
+		if not enabled then
+			return false, "stop_physics_failed"
+		end
 		self:_updateStopPhysicsTarget(currentRoot)
 	end
 
@@ -1499,6 +1543,7 @@ function Recorder:_exitStopMode()
 	self._rootSampleAccumulator = 0
 	self._lastRecordedRootCFrame = nil
 
+	self:_disableStopPhysics(true)
 	self._stopActive = false
 	self:_setState("recording")
 
@@ -1516,28 +1561,43 @@ function Recorder:_exitStopMode()
 		t = resumeTime,
 	})
 
-	self:_disableStopPhysics(true)
 	return true
 end
 
-function Recorder:_getStopTargetTimeByFrame(delta: number): (number?, number?)
+function Recorder:_getStopTargetTimeByFrame(delta: number): (number?, number?, string?)
 	if not self._live then
-		return nil, nil
+		return nil, nil, "no_recording_data"
 	end
 
 	local _, rootMotionEvents = self:_splitReplayEvents(self._live)
 	local count = #rootMotionEvents
 	if count <= 0 then
-		return nil, nil
+		return nil, nil, "no_recording_data"
 	end
 
-	local nextFrame = math.clamp((self._stopPreviewFrame or 1) + delta, 1, count)
+	local currentFrame = math.clamp(self._stopPreviewFrame or 1, 1, count)
+	if delta == 0 then
+		return nil, nil, "no_frame_change"
+	end
+
+	local unclampedTarget = currentFrame + delta
+	local nextFrame = math.clamp(unclampedTarget, 1, count)
+	if nextFrame == currentFrame then
+		if currentFrame <= 1 and delta < 0 then
+			return nil, nil, "at_first_frame"
+		end
+		if currentFrame >= count and delta > 0 then
+			return nil, nil, "at_last_frame"
+		end
+		return nil, nil, "no_frame_change"
+	end
+
 	local ev = rootMotionEvents[nextFrame]
 	if not ev then
-		return nil, nil
+		return nil, nil, "no_recording_data"
 	end
 
-	return tonumber(ev.t) or 0, nextFrame
+	return tonumber(ev.t) or 0, nextFrame, nil
 end
 
 function Recorder:_goStopFrame(delta: number)
@@ -1545,9 +1605,9 @@ function Recorder:_goStopFrame(delta: number)
 		return false, "stop_not_active"
 	end
 
-	local targetTime, targetFrame = self:_getStopTargetTimeByFrame(delta)
+	local targetTime, targetFrame, reason = self:_getStopTargetTimeByFrame(delta)
 	if targetTime == nil or targetFrame == nil then
-		return false, "no_recording_data"
+		return false, reason or "no_recording_data"
 	end
 
 	local ok = self:_applyStopPreview(targetTime)
@@ -2364,9 +2424,9 @@ function Recorder:_stopRecordingInternal()
 		self._recordStartClock = os.clock() - finalTime
 		self._rootSampleAccumulator = 0
 		self._lastRecordedRootCFrame = nil
-		self:_setState("recording")
-		self:_recordRootMotion(true)
+		self:_disableStopPhysics(false)
 		self._stopActive = false
+		self:_setState("recording")
 		if self._currentAnimTrack then
 			self._currentAnimTrack:AdjustSpeed(self._stopStoredMainSpeed)
 			self._currentAnimSpeed = self._stopStoredMainSpeed
@@ -2374,7 +2434,7 @@ function Recorder:_stopRecordingInternal()
 		if self._toolAnimTrack then
 			self._toolAnimTrack:AdjustSpeed(self._stopStoredToolSpeed)
 		end
-		self:_disableStopPhysics(false)
+		self:_recordRootMotion(true)
 	end
 
 	self:_recordRootMotion(true)
@@ -2426,121 +2486,138 @@ function Recorder:_clearSessionData()
 	self._stopStoredAngularVelocity = Vector3.zero
 	self._stopStoredMainSpeed = 1.0
 	self._stopStoredToolSpeed = 1.0
-	self._stopSeekToken = 0
+	self._apiBusy = false
+	self._apiBusyName = ""
 end
 
 function Recorder:Record()
-	if self._state == "playing" then
-		return false, "playing"
-	end
-	if self._state == "recording" then
-		return false, "already_recording"
-	end
-	if self._state == "stopped" and self._stopActive then
-		return false, "stop_active"
-	end
-	if not self:_ensureCharacterBound() then
-		return false, "character_not_ready"
-	end
+	return self:_runAtomicAction("Record", function()
+		if self._state == "playing" then
+			return false, "playing"
+		end
+		if self._state == "recording" then
+			return false, "already_recording"
+		end
+		if self._state == "stopped" and self._stopActive then
+			return false, "stop_active"
+		end
+		if not self:_ensureCharacterBound() then
+			return false, "character_not_ready"
+		end
 
-	self:_disablePlaybackPhysics()
-	self:_disableStopPhysics(false)
-	self:_disableDefaultAnimate()
-	self._savedSession = nil
-	self._savedDecoded = nil
+		self:_disablePlaybackPhysics()
+		self:_disableStopPhysics(false)
+		self:_disableDefaultAnimate()
+		self._savedSession = nil
+		self._savedDecoded = nil
 
-	self._live = {
-		meta = {
-			rig = "R6",
-			scale = self:_getRigScale(),
-			startedAt = os.clock(),
-			replayVersion = 4,
-			module = "HumanoidAnimRecorder",
-			rootMotion = true,
-			rootSampleRate = ROOT_SAMPLE_RATE,
-		},
-		animationSets = self:_snapshotResolvedAnimationSets(),
-		events = {},
-		trace = {},
-	}
+		self._live = {
+			meta = {
+				rig = "R6",
+				scale = self:_getRigScale(),
+				startedAt = os.clock(),
+				replayVersion = 4,
+				module = "HumanoidAnimRecorder",
+				rootMotion = true,
+				rootSampleRate = ROOT_SAMPLE_RATE,
+			},
+			animationSets = self:_snapshotResolvedAnimationSets(),
+			events = {},
+			trace = {},
+		}
 
-	self._recordStartClock = os.clock()
-	self._eventSeq = 0
-	self._stopActive = false
-	self:_setState("recording")
-	self._rootSampleAccumulator = 0
-	self._lastRecordedRootCFrame = nil
-	self._stopPreviewFrame = 1
-	self._stopPreviewTime = 0
-	self._stopResumeTruncateTime = nil
-	self._stopSeekToken = 0
+		self._recordStartClock = os.clock()
+		self._eventSeq = 0
+		self._stopActive = false
+		self:_setState("recording")
+		self._rootSampleAccumulator = 0
+		self._lastRecordedRootCFrame = nil
+		self._stopPreviewFrame = 1
+		self._stopPreviewTime = 0
+		self._stopResumeTruncateTime = nil
+		self._stopSeekToken = 0
 
-	self:_pushEvent("session_start", {
-		initialPose = self._pose,
-		currentAnim = self._currentAnim,
-		currentToolAnim = self._currentToolAnimName,
-	})
+		self:_pushEvent("session_start", {
+			initialPose = self._pose,
+			currentAnim = self._currentAnim,
+			currentToolAnim = self._currentToolAnimName,
+		})
 
-	self:_recordCurrentAnimationState()
-	self:_recordRootMotion(true)
+		self:_recordCurrentAnimationState()
+		self:_recordRootMotion(true)
 
-	return true
+		return true
+	end)
 end
 
 function Recorder:Stop()
-	if self._state == "recording" then
-		return self:_enterStopMode()
-	end
+	return self:_runAtomicAction("Stop", function()
+		if self._state == "recording" then
+			return self:_enterStopMode()
+		end
 
-	if self._state == "stopped" and self._stopActive then
+		if self._state == "stopped" and self._stopActive then
+			return false, "already_stopped"
+		end
+
+		if self._state == "playing" then
+			return self:_stopPlaybackInternal()
+		end
+
+		return false, "nothing_to_stop"
+	end)
+end
+
+function Recorder:Resume()
+	return self:_runAtomicAction("Resume", function()
 		return self:_exitStopMode()
-	end
-
-	if self._state == "playing" then
-		return self:_stopPlaybackInternal()
-	end
-
-	return false, "nothing_to_stop"
+	end)
 end
 
 function Recorder:goBack(frameCount: number)
-	local delta = math.floor(math.abs(tonumber(frameCount) or 0))
-	if delta <= 0 then
-		return false, "invalid_frame"
-	end
+	return self:_runAtomicAction("goBack", function()
+		local delta = math.floor(math.abs(tonumber(frameCount) or 0))
+		if delta <= 0 then
+			return false, "invalid_frame"
+		end
 
-	return self:_goStopFrame(-delta)
+		return self:_goStopFrame(-delta)
+	end)
 end
 
 function Recorder:goFront(frameCount: number)
-	local delta = math.floor(math.abs(tonumber(frameCount) or 0))
-	if delta <= 0 then
-		return false, "invalid_frame"
-	end
+	return self:_runAtomicAction("goFront", function()
+		local delta = math.floor(math.abs(tonumber(frameCount) or 0))
+		if delta <= 0 then
+			return false, "invalid_frame"
+		end
 
-	return self:_goStopFrame(delta)
+		return self:_goStopFrame(delta)
+	end)
 end
 
 function Recorder:Save()
-	if self._state == "recording" or (self._state == "stopped" and self._stopActive) then
-		local ok, reason = self:_stopRecordingInternal()
-		if not ok then
-			return false, reason
+	return self:_runAtomicAction("Save", function()
+		if self._state == "recording" or (self._state == "stopped" and self._stopActive) then
+			local ok, reason = self:_stopRecordingInternal()
+			if not ok then
+				return false, reason
+			end
 		end
-	end
 
-	if self._state == "saved" and self._savedSession then
+		if self._state == "saved" and self._savedSession then
+			return true, self._savedSession
+		end
+
+		if self._state ~= "stopped" or not self._live then
+			return false, "no_recording_data"
+		end
+
+		self._savedSession = HttpService:JSONEncode(self._live)
+		self._savedDecoded = self._live
+		self:_setState("saved")
 		return true, self._savedSession
-	end
-
-	if self._state ~= "stopped" or not self._live then
-		return false, "no_recording_data"
-	end
-
-	self._savedSession = HttpService:JSONEncode(self._live)
-	self._savedDecoded = self._live
-	self:_setState("saved")
-	return true, self._savedSession
+	end)
 end
 
 function Recorder:_loadSavedString(savedString: string)
@@ -2577,211 +2654,212 @@ function Recorder:_waitUntilPlaybackOffset(startClock: number, targetOffset: num
 end
 
 function Recorder:Play(savedString: string?)
-	if self._state == "recording" or (self._state == "stopped" and self._stopActive) then
-		local okStop, reason = self:_stopRecordingInternal()
-		if not okStop then
-			return false, reason
+	return self:_runAtomicAction("Play", function()
+		if self._state == "recording" or (self._state == "stopped" and self._stopActive) then
+			local okStop, reason = self:_stopRecordingInternal()
+			if not okStop then
+				return false, reason
+			end
 		end
-	end
 
-	if self._state == "playing" then
-		return false, "already_playing"
-	end
-
-	if not self:_ensureCharacterBound() then
-		return false, "character_not_ready"
-	end
-
-	if savedString then
-		local okLoad = self:_loadSavedString(savedString)
-		if not okLoad then
-			return false, "decode_failed"
+		if self._state == "playing" then
+			return false, "already_playing"
 		end
-	elseif self._state == "stopped" and self._live and not self._savedSession then
-		local okSave = self:Save()
-		if not okSave then
-			return false, "save_failed"
+
+		if not self:_ensureCharacterBound() then
+			return false, "character_not_ready"
 		end
-	end
 
-	if not self._savedSession then
-		return false, "no_saved_data"
-	end
-	if not self._humanoid then
-		return false, "character_not_ready"
-	end
+		if savedString then
+			local okLoad = self:_loadSavedString(savedString)
+			if not okLoad then
+				return false, "decode_failed"
+			end
+		elseif self._state == "stopped" and self._live and not self._savedSession then
+			self._savedSession = HttpService:JSONEncode(self._live)
+			self._savedDecoded = self._live
+			self:_setState("saved")
+		end
 
-	local session = self._savedDecoded
-	if session == nil then
-		local ok, decoded = pcall(function()
-			return HttpService:JSONDecode(self._savedSession :: string)
+		if not self._savedSession then
+			return false, "no_saved_data"
+		end
+		if not self._humanoid then
+			return false, "character_not_ready"
+		end
+
+		local session = self._savedDecoded
+		if session == nil then
+			local ok, decoded = pcall(function()
+				return HttpService:JSONDecode(self._savedSession :: string)
+			end)
+			if not ok then
+				return false, "decode_failed"
+			end
+			session = decoded
+			self._savedDecoded = decoded
+		end
+
+		local replayEvents, rootMotionEvents = self:_splitReplayEvents(session)
+		local initialRootCFrame = if #rootMotionEvents > 0 then decodeCFrame(rootMotionEvents[1]) else nil
+
+		self._playing = true
+		self:_setState("playing")
+		self._playToken += 1
+		local myToken = self._playToken
+
+		task.spawn(function()
+			self:_disablePlaybackPhysics()
+			self:_disableStopPhysics(false)
+			self:_stopAllAnimations(true, 0)
+			self:_stopToolAnimations(true)
+
+			if initialRootCFrame then
+				self:_applyImmediateRootMotion(initialRootCFrame, true)
+				self:_enablePlaybackPhysics(initialRootCFrame)
+				self:_applyPlaybackRootMotion(initialRootCFrame)
+			end
+
+			local startClock = os.clock()
+
+			if #rootMotionEvents > 0 then
+				task.spawn(function()
+					while self._playing and self._playToken == myToken do
+						local elapsed = os.clock() - startClock
+						local sampled = self:_sampleRootMotion(rootMotionEvents, elapsed)
+						if sampled then
+							self:_applyPlaybackRootMotion(sampled)
+						end
+						RunService.Heartbeat:Wait()
+					end
+				end)
+			end
+
+			for _, ev in ipairs(replayEvents) do
+				if not self._playing or self._playToken ~= myToken then
+					break
+				end
+
+				self:_waitUntilPlaybackOffset(startClock, tonumber(ev.t) or 0, myToken)
+
+				if not self._playing or self._playToken ~= myToken then
+					break
+				end
+
+				local kind = ev.kind
+
+				if kind == "session_start" then
+					self._pose = ev.initialPose or "Standing"
+
+				elseif kind == "pose" then
+					self._pose = ev.value or self._pose
+
+				elseif kind == "speed" then
+					if ev.target == "main" then
+						self:_setAnimationSpeed(tonumber(ev.value) or 1, true)
+					end
+
+				elseif kind == "playAnimation" then
+					self:_playAnimation(
+						ev.animName or "idle",
+						tonumber(ev.transitionTime) or 0,
+						self._humanoid :: Humanoid,
+						ev.animId,
+						true
+					)
+					if ev.speed ~= nil then
+						self:_setAnimationSpeed(tonumber(ev.speed) or 1, true)
+					end
+
+				elseif kind == "stopAnimation" then
+					self:_stopAllAnimations(true, tonumber(ev.transitionTime) or 0)
+
+				elseif kind == "playToolAnimation" then
+					self._toolAnimSignal = ev.signal or self._toolAnimSignal
+					self:_playToolAnimation(
+						ev.animName or "toolnone",
+						tonumber(ev.transitionTime) or 0,
+						self._humanoid :: Humanoid,
+						self:_parsePriority(ev.priority),
+						ev.animId,
+						true
+					)
+
+				elseif kind == "stopToolAnimation" then
+					self:_stopToolAnimations(true)
+
+				elseif kind == "tool_anim_signal" then
+					self._toolAnimSignal = ev.value or "None"
+
+				elseif kind == "session_stop" then
+					-- no-op, for audit only
+
+				elseif kind == "emote" then
+					-- no-op, because actual playback is driven by playAnimation events
+				end
+			end
+
+			if self._playToken == myToken then
+				self._playing = false
+				self:_setState("saved")
+
+				self:_disablePlaybackPhysics()
+				self:_stopToolAnimations(true)
+
+				if self._humanoid then
+					self:_playAnimation("idle", 0.1, self._humanoid)
+					self._pose = "Standing"
+				end
+			end
 		end)
-		if not ok then
-			return false, "decode_failed"
-		end
-		session = decoded
-		self._savedDecoded = decoded
-	end
 
-	local replayEvents, rootMotionEvents = self:_splitReplayEvents(session)
-	local initialRootCFrame = if #rootMotionEvents > 0 then decodeCFrame(rootMotionEvents[1]) else nil
+		return true
+	end)
+end
 
-	self._playing = true
-	self:_setState("playing")
-	self._playToken += 1
-	local myToken = self._playToken
+function Recorder:Reset()
+	return self:_runAtomicAction("Reset", function()
+		self._playing = false
+		self._playToken += 1
+		self._stopActive = false
 
-	task.spawn(function()
+		self:_disconnectAll()
 		self:_disablePlaybackPhysics()
 		self:_disableStopPhysics(false)
 		self:_stopAllAnimations(true, 0)
 		self:_stopToolAnimations(true)
+		self:_restoreDefaultAnimate()
 
-		if initialRootCFrame then
-			self:_applyImmediateRootMotion(initialRootCFrame, true)
+		self._character = nil
+		self._humanoid = nil
+		self._torso = nil
+		self._rootPart = nil
+		self._rightShoulder = nil
+		self._leftShoulder = nil
+		self._rightHip = nil
+		self._leftHip = nil
+		self._neck = nil
+		self._animator = nil
 
-			self:_enablePlaybackPhysics(initialRootCFrame)
-			self:_applyPlaybackRootMotion(initialRootCFrame)
-		end
+		self._pose = "Standing"
+		self._toolAnimSignal = "None"
+		self._toolAnimTime = 0
+		self._simTime = 0
+		self._lastTick = 0
+		self._stopPreviewFrame = 1
+		self._stopPreviewTime = 0
+		self._stopResumeTruncateTime = nil
+		self:_clearSessionData()
 
-		local startClock = os.clock()
-
-		if #rootMotionEvents > 0 then
-			task.spawn(function()
-				while self._playing and self._playToken == myToken do
-					local elapsed = os.clock() - startClock
-					local sampled = self:_sampleRootMotion(rootMotionEvents, elapsed)
-					if sampled then
-						self:_applyPlaybackRootMotion(sampled)
-					end
-					RunService.Heartbeat:Wait()
-				end
-			end)
-		end
-
-		for _, ev in ipairs(replayEvents) do
-			if not self._playing or self._playToken ~= myToken then
-				break
-			end
-
-			self:_waitUntilPlaybackOffset(startClock, tonumber(ev.t) or 0, myToken)
-
-			if not self._playing or self._playToken ~= myToken then
-				break
-			end
-
-			local kind = ev.kind
-
-			if kind == "session_start" then
-				self._pose = ev.initialPose or "Standing"
-
-			elseif kind == "pose" then
-				self._pose = ev.value or self._pose
-
-			elseif kind == "speed" then
-				if ev.target == "main" then
-					self:_setAnimationSpeed(tonumber(ev.value) or 1, true)
-				end
-
-			elseif kind == "playAnimation" then
-				self:_playAnimation(
-					ev.animName or "idle",
-					tonumber(ev.transitionTime) or 0,
-					self._humanoid :: Humanoid,
-					ev.animId,
-					true
-				)
-				if ev.speed ~= nil then
-					self:_setAnimationSpeed(tonumber(ev.speed) or 1, true)
-				end
-
-			elseif kind == "stopAnimation" then
-				self:_stopAllAnimations(true, tonumber(ev.transitionTime) or 0)
-
-			elseif kind == "playToolAnimation" then
-				self._toolAnimSignal = ev.signal or self._toolAnimSignal
-				self:_playToolAnimation(
-					ev.animName or "toolnone",
-					tonumber(ev.transitionTime) or 0,
-					self._humanoid :: Humanoid,
-					self:_parsePriority(ev.priority),
-					ev.animId,
-					true
-				)
-
-			elseif kind == "stopToolAnimation" then
-				self:_stopToolAnimations(true)
-
-			elseif kind == "tool_anim_signal" then
-				self._toolAnimSignal = ev.value or "None"
-
-			elseif kind == "session_stop" then
-				-- no-op, for audit only
-
-			elseif kind == "emote" then
-				-- no-op, because actual playback is driven by playAnimation events
-			end
-		end
-
-		if self._playToken == myToken then
-			self._playing = false
-			self:_setState("saved")
-
-			self:_disablePlaybackPhysics()
-			self:_stopToolAnimations(true)
-
-			if self._humanoid then
-				self:_playAnimation("idle", 0.1, self._humanoid)
-				self._pose = "Standing"
-			end
-		end
+		self:_setState("idle")
+		return true
 	end)
-
-	return true
-end
-
-function Recorder:Reset()
-	self._playing = false
-	self._playToken += 1
-	self._stopActive = false
-
-	self:_disconnectAll()
-	self:_disablePlaybackPhysics()
-	self:_disableStopPhysics(false)
-	self:_stopAllAnimations(true, 0)
-	self:_stopToolAnimations(true)
-	self:_restoreDefaultAnimate()
-
-	self._character = nil
-	self._humanoid = nil
-	self._torso = nil
-	self._rootPart = nil
-	self._rightShoulder = nil
-	self._leftShoulder = nil
-	self._rightHip = nil
-	self._leftHip = nil
-	self._neck = nil
-	self._animator = nil
-
-	self._pose = "Standing"
-	self._toolAnimSignal = "None"
-	self._toolAnimTime = 0
-	self._simTime = 0
-	self._lastTick = 0
-	self._stopPreviewFrame = 1
-	self._stopPreviewTime = 0
-	self._stopResumeTruncateTime = nil
-	self:_clearSessionData()
-
-	self:_setState("idle")
-	return true
 end
 
 local singleton = Recorder.new()
 singleton:_setState("idle")
 return singleton
 
-	
 	-- ▲▲▲▲▲ 模塊代碼貼上區域結束 ▲▲▲▲▲
 	
 end)()
