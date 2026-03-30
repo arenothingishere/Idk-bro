@@ -1,0 +1,2913 @@
+-- =========================================================
+-- 單一腳本 GUI 控制面板 (包含代碼插槽與按鈕狀態視覺)
+-- 請直接將這個 LocalScript 放到 StarterPlayerScripts
+-- =========================================================
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local player = Players.LocalPlayer
+
+-- =========================================================
+--[ 核心模塊代碼插槽 ]
+-- 請將你的最新模塊代碼完整貼在下方 (包含 return singleton)
+-- =========================================================
+local RecorderModule = (function()
+	
+	-- ▼▼▼▼▼ 請將你的模塊代碼完整貼在下方 ▼▼▼▼▼
+	
+	--!strict
+-- ModuleScript: HumanoidAnimRecorder
+-- Purpose:
+--   Rebuild Roblox's classic R6 Animate LocalScript logic in a module form,
+--   while recording both:
+--   1) deterministic replay events (session.events)
+--   2) verbose action trace      (session.trace)
+--   3) root motion playback data (session.events: rootMotion)
+--
+-- Public API:
+--   Recorder:Record()
+--   Recorder:Stop()
+--   Recorder:Save()
+--   Recorder:Play(savedString?)
+--   Recorder:goBack(frameCount)
+--   Recorder:goFront(frameCount)
+--   Recorder:Reset()
+--
+-- Notes:
+--   - Local-player only module; no external Start(character) needed.
+--   - Status is mirrored on Recorder.Status and internal _state.
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local HttpService = game:GetService("HttpService")
+local Workspace = game:GetService("Workspace")
+
+local LOCAL_PLAYER = Players.LocalPlayer
+
+local ROOT_MOTION_KIND = "rootMotion"
+local ROOT_SAMPLE_RATE = 1 / 60
+local ROOT_SAMPLE_EPSILON = 0.0005
+
+local PLAYBACK_ALIGN_RESPONSIVENESS = 200
+local PLAYBACK_ALIGN_MAX_FORCE = 1000000000
+local PLAYBACK_ALIGN_MAX_TORQUE = 1000000000
+local PLAYBACK_ALIGN_MAX_VELOCITY = 1000000
+local PLAYBACK_ALIGN_MAX_ANGULAR_VELOCITY = 1000000
+
+local Recorder = {}
+Recorder.__index = Recorder
+
+export type AnimEntry = {
+	id: string,
+	weight: number,
+}
+
+type PoolItem = {
+	anim: Animation,
+	weight: number,
+	transient: boolean?,
+}
+
+type AnimPool = {
+	count: number,
+	totalWeight: number,
+	connections: { RBXScriptConnection },
+	[number]: PoolItem,
+}
+
+type SessionEvent = {
+	seq: number,
+	kind: string,
+	t: number,
+	pose: string,
+	state: string,
+	[string]: any,
+}
+
+type LiveSession = {
+	meta: { [string]: any },
+	animationSets: { [string]: { AnimEntry } },
+	events: { SessionEvent },
+	trace: { SessionEvent },
+}
+
+local DEFAULT_ANIMS: { [string]: { AnimEntry } } = {
+	idle = {
+		{ id = "http://www.roblox.com/asset/?id=180435571", weight = 9 },
+		{ id = "http://www.roblox.com/asset/?id=180435792", weight = 1 },
+	},
+	walk = {
+		{ id = "http://www.roblox.com/asset/?id=180426354", weight = 10 },
+	},
+	run = {
+		{ id = "run.xml", weight = 10 },
+	},
+	jump = {
+		{ id = "http://www.roblox.com/asset/?id=125750702", weight = 10 },
+	},
+	fall = {
+		{ id = "http://www.roblox.com/asset/?id=180436148", weight = 10 },
+	},
+	climb = {
+		{ id = "http://www.roblox.com/asset/?id=180436334", weight = 10 },
+	},
+	sit = {
+		{ id = "http://www.roblox.com/asset/?id=178130996", weight = 10 },
+	},
+	toolnone = {
+		{ id = "http://www.roblox.com/asset/?id=182393478", weight = 10 },
+	},
+	toolslash = {
+		{ id = "http://www.roblox.com/asset/?id=129967390", weight = 10 },
+	},
+	toollunge = {
+		{ id = "http://www.roblox.com/asset/?id=129967478", weight = 10 },
+	},
+	wave = {
+		{ id = "http://www.roblox.com/asset/?id=128777973", weight = 10 },
+	},
+	point = {
+		{ id = "http://www.roblox.com/asset/?id=128853357", weight = 10 },
+	},
+	dance1 = {
+		{ id = "http://www.roblox.com/asset/?id=182435998", weight = 10 },
+		{ id = "http://www.roblox.com/asset/?id=182491037", weight = 10 },
+		{ id = "http://www.roblox.com/asset/?id=182491065", weight = 10 },
+	},
+	dance2 = {
+		{ id = "http://www.roblox.com/asset/?id=182436842", weight = 10 },
+		{ id = "http://www.roblox.com/asset/?id=182491248", weight = 10 },
+		{ id = "http://www.roblox.com/asset/?id=182491277", weight = 10 },
+	},
+	dance3 = {
+		{ id = "http://www.roblox.com/asset/?id=182436935", weight = 10 },
+		{ id = "http://www.roblox.com/asset/?id=182491368", weight = 10 },
+		{ id = "http://www.roblox.com/asset/?id=182491423", weight = 10 },
+	},
+	laugh = {
+		{ id = "http://www.roblox.com/asset/?id=129423131", weight = 10 },
+	},
+	cheer = {
+		{ id = "http://www.roblox.com/asset/?id=129423030", weight = 10 },
+	},
+}
+
+local EMOTE_NAMES: { [string]: boolean } = {
+	wave = false,
+	point = false,
+	dance1 = true,
+	dance2 = true,
+	dance3 = true,
+	laugh = false,
+	cheer = false,
+}
+
+local DANCES = { "dance1", "dance2", "dance3" }
+
+local PRIORITY_BY_NAME = {
+	Core = Enum.AnimationPriority.Core,
+	Idle = Enum.AnimationPriority.Idle,
+	Movement = Enum.AnimationPriority.Movement,
+	Action = Enum.AnimationPriority.Action,
+	Action2 = Enum.AnimationPriority.Action2,
+	Action3 = Enum.AnimationPriority.Action3,
+	Action4 = Enum.AnimationPriority.Action4,
+}
+
+local function shallowCopy(source: { [string]: any }?): { [string]: any }
+	local out = {}
+	if not source then
+		return out
+	end
+	for k, v in pairs(source) do
+		out[k] = v
+	end
+	return out
+end
+
+local function deepCloneAnimList(list: { AnimEntry }?): { AnimEntry }
+	local out = {}
+	if not list then
+		return out
+	end
+	for i, v in ipairs(list) do
+		out[i] = {
+			id = v.id,
+			weight = v.weight,
+		}
+	end
+	return out
+end
+
+local function deepCloneAnimSet(source: { [string]: { AnimEntry } }): { [string]: { AnimEntry } }
+	local out = {}
+	for name, list in pairs(source) do
+		out[name] = deepCloneAnimList(list)
+	end
+	return out
+end
+
+local function priorityToName(priority: Enum.AnimationPriority?): string
+	if priority == nil then
+		return "Idle"
+	end
+	for name, enumItem in pairs(PRIORITY_BY_NAME) do
+		if enumItem == priority then
+			return name
+		end
+	end
+	return "Idle"
+end
+
+local function encodeCFrame(cf: CFrame): { [string]: number }
+	local x, y, z, r00, r01, r02, r10, r11, r12, r20, r21, r22 = cf:GetComponents()
+	return {
+		x = x,
+		y = y,
+		z = z,
+		r00 = r00,
+		r01 = r01,
+		r02 = r02,
+		r10 = r10,
+		r11 = r11,
+		r12 = r12,
+		r20 = r20,
+		r21 = r21,
+		r22 = r22,
+	}
+end
+
+local function decodeCFrame(payload: { [string]: any }): CFrame
+	return CFrame.new(
+		tonumber(payload.x) or 0,
+		tonumber(payload.y) or 0,
+		tonumber(payload.z) or 0,
+		tonumber(payload.r00) or 1,
+		tonumber(payload.r01) or 0,
+		tonumber(payload.r02) or 0,
+		tonumber(payload.r10) or 0,
+		tonumber(payload.r11) or 1,
+		tonumber(payload.r12) or 0,
+		tonumber(payload.r20) or 0,
+		tonumber(payload.r21) or 0,
+		tonumber(payload.r22) or 1
+	)
+end
+
+local function cframeComponentDelta(a: CFrame, b: CFrame): number
+	local ax, ay, az, ar00, ar01, ar02, ar10, ar11, ar12, ar20, ar21, ar22 = a:GetComponents()
+	local bx, by, bz, br00, br01, br02, br10, br11, br12, br20, br21, br22 = b:GetComponents()
+
+	return math.max(
+		math.abs(ax - bx),
+		math.abs(ay - by),
+		math.abs(az - bz),
+		math.abs(ar00 - br00),
+		math.abs(ar01 - br01),
+		math.abs(ar02 - br02),
+		math.abs(ar10 - br10),
+		math.abs(ar11 - br11),
+		math.abs(ar12 - br12),
+		math.abs(ar20 - br20),
+		math.abs(ar21 - br21),
+		math.abs(ar22 - br22)
+	)
+end
+
+local function getPivotOffsetInverse(rootPart: BasePart?): CFrame
+	if not rootPart then
+		return CFrame.identity
+	end
+
+	local ok, pivotOffset = pcall(function()
+		return rootPart.PivotOffset
+	end)
+	if ok and typeof(pivotOffset) == "CFrame" then
+		return pivotOffset:Inverse()
+	end
+
+	return CFrame.identity
+end
+
+function Recorder.new()
+	local self = setmetatable({}, Recorder)
+
+	self._moduleScript = script
+
+	self._character = nil :: Model?
+	self._torso = nil :: BasePart?
+	self._rootPart = nil :: BasePart?
+	self._rightShoulder = nil :: Motor6D?
+	self._leftShoulder = nil :: Motor6D?
+	self._rightHip = nil :: Motor6D?
+	self._leftHip = nil :: Motor6D?
+	self._neck = nil :: Motor6D?
+	self._humanoid = nil :: Humanoid?
+	self._animator = nil :: Animator?
+
+	self._pose = "Standing"
+
+	self._currentAnim = ""
+	self._currentAnimInstance = nil :: Animation?
+	self._currentAnimTrack = nil :: AnimationTrack?
+	self._currentAnimKeyframeHandler = nil :: RBXScriptConnection?
+	self._currentAnimSpeed = 1.0
+	self._currentAnimIsTransient = false
+
+	self._toolAnimSignal = "None"
+	self._toolAnimTime = 0
+	self._currentToolAnimName = ""
+	self._toolAnimTrack = nil :: AnimationTrack?
+	self._toolAnimInstance = nil :: Animation?
+	self._currentToolAnimKeyframeHandler = nil :: RBXScriptConnection?
+	self._currentToolAnimIsTransient = false
+
+	self._jumpAnimTime = 0
+	self._jumpAnimDuration = 0.3
+	self._toolTransitionTime = 0.1
+	self._fallTransitionTime = 0.3
+	self._jumpMaxLimbVelocity = 0.75
+	self._lastTick = 0
+	self._simTime = 0
+
+	self._animTable = {} :: { [string]: AnimPool }
+	self._animNames = deepCloneAnimSet(DEFAULT_ANIMS)
+	self._emoteNames = table.clone(EMOTE_NAMES)
+
+	self._runningConn = nil :: RBXScriptConnection?
+	self._diedConn = nil :: RBXScriptConnection?
+	self._jumpingConn = nil :: RBXScriptConnection?
+	self._climbingConn = nil :: RBXScriptConnection?
+	self._gettingUpConn = nil :: RBXScriptConnection?
+	self._freeFallConn = nil :: RBXScriptConnection?
+	self._fallingDownConn = nil :: RBXScriptConnection?
+	self._seatedConn = nil :: RBXScriptConnection?
+	self._platformStandingConn = nil :: RBXScriptConnection?
+	self._swimmingConn = nil :: RBXScriptConnection?
+	self._stateChangedConn = nil :: RBXScriptConnection?
+	self._childAddedConn = nil :: RBXScriptConnection?
+	self._childRemovedConn = nil :: RBXScriptConnection?
+	self._heartbeatConn = nil :: RBXScriptConnection?
+	self._chatConn = nil :: RBXScriptConnection?
+
+	self._playEmoteBindable = nil :: BindableFunction?
+	self._disabledAnimateScript = nil :: LocalScript | Script?
+
+	self._state = "idle" -- idle / recording / stopped / saved / playing
+	self.Status = "idle"
+	self._playing = false
+	self._live = nil :: LiveSession?
+	self._savedSession = nil :: string?
+	self._savedDecoded = nil :: any?
+	self._recordStartClock = 0
+	self._eventSeq = 0
+	self._playToken = 0
+
+	self._rootSampleAccumulator = 0
+	self._lastRecordedRootCFrame = nil :: CFrame?
+	self._playbackMover = nil :: any
+	self._playbackMotionIndex = 1
+
+	self._stopActive = false
+	self._stopMover = nil :: any
+	self._stopPreviewFrame = 1
+	self._stopPreviewTime = 0
+	self._stopResumeTruncateTime = nil :: number?
+	self._stopStoredLinearVelocity = Vector3.zero
+	self._stopStoredAngularVelocity = Vector3.zero
+	self._stopStoredMainSpeed = 1.0
+	self._stopStoredToolSpeed = 1.0
+
+	return self
+end
+
+function Recorder:_isRuntimeSuppressed(): boolean
+	return self._playing or self._stopActive
+end
+
+function Recorder:_getRigScale(): number
+	local character = self._character
+	if not character then
+		return 1
+	end
+
+	local ok, scale = pcall(function()
+		return character:GetScale()
+	end)
+	if ok and typeof(scale) == "number" and scale > 0 then
+		return scale
+	end
+
+	return 1
+end
+
+function Recorder:_disableDefaultAnimate()
+	local character = self._character
+	if not character then
+		return
+	end
+
+	local animate = character:FindFirstChild("Animate")
+	if animate and (animate:IsA("LocalScript") or animate:IsA("Script")) then
+		if not animate.Disabled then
+			self._disabledAnimateScript = animate
+			animate.Disabled = true
+		end
+	end
+end
+
+function Recorder:_restoreDefaultAnimate()
+	local animate = self._disabledAnimateScript
+	if animate and animate.Parent then
+		animate.Disabled = false
+	end
+	self._disabledAnimateScript = nil
+end
+
+function Recorder:_destroyAnimationObject(anim: Animation?, isTransient: boolean)
+	if anim and isTransient then
+		anim:Destroy()
+	end
+end
+
+function Recorder:_makeTempAnimation(animName: string, animId: string): PoolItem
+	local anim = Instance.new("Animation")
+	anim.Name = animName
+	anim.AnimationId = animId
+	return {
+		anim = anim,
+		weight = 1,
+		transient = true,
+	}
+end
+
+function Recorder:_log(kind: string, payload: { [string]: any }?, replayRelevant: boolean)
+	if self._state ~= "recording" or self._playing or not self._live then
+		return
+	end
+
+	local event = shallowCopy(payload)
+	self._eventSeq += 1
+	event.seq = self._eventSeq
+	event.kind = kind
+	event.t = os.clock() - self._recordStartClock
+	event.pose = self._pose
+	event.state = self._state
+
+	table.insert(self._live.trace, shallowCopy(event) :: SessionEvent)
+	if replayRelevant then
+		table.insert(self._live.events, event :: SessionEvent)
+	end
+end
+
+function Recorder:_pushEvent(kind: string, payload: { [string]: any }?)
+	self:_log(kind, payload, true)
+end
+
+function Recorder:_pushTrace(kind: string, payload: { [string]: any }?)
+	self:_log(kind, payload, false)
+end
+
+function Recorder:_snapshotResolvedAnimationSets(): { [string]: { AnimEntry } }
+	local out = {}
+	for name, pool in pairs(self._animTable) do
+		local list = {}
+		for i = 1, pool.count do
+			local item = pool[i]
+			if item and item.anim then
+				table.insert(list, {
+					id = item.anim.AnimationId,
+					weight = item.weight,
+				})
+			end
+		end
+		out[name] = list
+	end
+	return out
+end
+
+function Recorder:_configureAnimationSet(name: string, fileList: { AnimEntry })
+	local animTable = self._animTable
+	local old = animTable[name]
+	if old then
+		for _, connection in ipairs(old.connections) do
+			connection:Disconnect()
+		end
+	end
+
+	animTable[name] = {
+		count = 0,
+		totalWeight = 0,
+		connections = {},
+	} :: any
+
+	local config = self._moduleScript:FindFirstChild(name)
+	if config then
+		table.insert(animTable[name].connections, config.ChildAdded:Connect(function()
+			self:_configureAnimationSet(name, fileList)
+		end))
+		table.insert(animTable[name].connections, config.ChildRemoved:Connect(function()
+			self:_configureAnimationSet(name, fileList)
+		end))
+
+		local idx = 1
+		for _, childPart in ipairs(config:GetChildren()) do
+			if childPart:IsA("Animation") then
+				table.insert(animTable[name].connections, childPart.Changed:Connect(function()
+					self:_configureAnimationSet(name, fileList)
+				end))
+
+				animTable[name][idx] = {}
+				animTable[name][idx].anim = childPart
+
+				local weightObject = childPart:FindFirstChild("Weight")
+				if weightObject and weightObject:IsA("IntValue") then
+					animTable[name][idx].weight = weightObject.Value
+				else
+					animTable[name][idx].weight = 1
+				end
+
+				animTable[name].count += 1
+				animTable[name].totalWeight += animTable[name][idx].weight
+				idx += 1
+			end
+		end
+	end
+
+	if animTable[name].count <= 0 then
+		for idx, animEntry in ipairs(fileList) do
+			local anim = Instance.new("Animation")
+			anim.Name = name
+			anim.AnimationId = animEntry.id
+
+			animTable[name][idx] = {
+				anim = anim,
+				weight = animEntry.weight,
+				transient = false,
+			}
+			animTable[name].count += 1
+			animTable[name].totalWeight += animEntry.weight
+		end
+	end
+end
+
+function Recorder:_scriptChildModified(child: Instance)
+	local fileList = self._animNames[child.Name]
+	if fileList then
+		self:_configureAnimationSet(child.Name, fileList)
+	end
+end
+
+function Recorder:_chooseAnimation(animName: string, forcedAnimId: string?): (PoolItem?, AnimPool?)
+	local pool = self._animTable[animName]
+	if not forcedAnimId then
+		if not pool or pool.count <= 0 then
+			return nil, nil
+		end
+
+		local roll = math.random(1, pool.totalWeight)
+		local idx = 1
+		while idx <= pool.count and roll > pool[idx].weight do
+			roll -= pool[idx].weight
+			idx += 1
+		end
+		return pool[idx], pool
+	end
+
+	if pool then
+		for i = 1, pool.count do
+			local item = pool[i]
+			if item and item.anim and item.anim.AnimationId == forcedAnimId then
+				return item, pool
+			end
+		end
+	end
+
+	return self:_makeTempAnimation(animName, forcedAnimId), pool
+end
+
+function Recorder:_stopAllAnimations(silent: boolean?, transitionTime: number?): string
+	local oldAnim = self._currentAnim
+
+	if self._emoteNames[oldAnim] ~= nil and self._emoteNames[oldAnim] == false then
+		oldAnim = "idle"
+	end
+
+	local hadTrack = self._currentAnimTrack ~= nil
+
+	self._currentAnim = ""
+	if self._currentAnimKeyframeHandler then
+		self._currentAnimKeyframeHandler:Disconnect()
+		self._currentAnimKeyframeHandler = nil
+	end
+
+	if self._currentAnimTrack then
+		self._currentAnimTrack:Stop(transitionTime or 0)
+		self._currentAnimTrack:Destroy()
+		self._currentAnimTrack = nil
+	end
+
+	self:_destroyAnimationObject(self._currentAnimInstance, self._currentAnimIsTransient)
+	self._currentAnimInstance = nil
+	self._currentAnimIsTransient = false
+	self._currentAnimSpeed = 1.0
+
+	if hadTrack and not silent then
+		self:_pushEvent("stopAnimation", {
+			animName = oldAnim,
+			transitionTime = transitionTime or 0,
+		})
+	end
+
+	return oldAnim
+end
+
+function Recorder:_stopToolAnimations(silent: boolean?): string
+	local oldAnim = self._currentToolAnimName
+	local hadTrack = self._toolAnimTrack ~= nil
+
+	if self._currentToolAnimKeyframeHandler then
+		self._currentToolAnimKeyframeHandler:Disconnect()
+		self._currentToolAnimKeyframeHandler = nil
+	end
+
+	if self._toolAnimTrack then
+		self._toolAnimTrack:Stop()
+		self._toolAnimTrack:Destroy()
+		self._toolAnimTrack = nil
+	end
+
+	self:_destroyAnimationObject(self._toolAnimInstance, self._currentToolAnimIsTransient)
+	self._toolAnimInstance = nil
+	self._currentToolAnimIsTransient = false
+	self._currentToolAnimName = ""
+
+	if hadTrack and not silent then
+		self:_pushEvent("stopToolAnimation", {
+			animName = oldAnim,
+		})
+	end
+
+	return oldAnim
+end
+
+function Recorder:_setAnimationSpeed(speed: number, silent: boolean?)
+	if speed == self._currentAnimSpeed then
+		return
+	end
+
+	self._currentAnimSpeed = speed
+	if self._currentAnimTrack then
+		self._currentAnimTrack:AdjustSpeed(speed)
+	end
+
+	if not silent then
+		self:_pushEvent("speed", {
+			target = "main",
+			value = speed,
+			animName = self._currentAnim,
+		})
+	end
+end
+
+function Recorder:_playAnimation(
+	animName: string,
+	transitionTime: number,
+	humanoid: Humanoid,
+	forcedAnimId: string?,
+	silent: boolean?
+): (AnimationTrack?, boolean)
+	local selected, pool = self:_chooseAnimation(animName, forcedAnimId)
+	if not selected or not selected.anim then
+		return nil, false
+	end
+
+	local anim = selected.anim
+	local switched = anim ~= self._currentAnimInstance
+
+	if switched or forcedAnimId ~= nil or self._currentAnim ~= animName then
+		self:_pushTrace("playAnimation_request", {
+			animName = animName,
+			animId = anim.AnimationId,
+			transitionTime = transitionTime,
+			switch = switched,
+			forced = forcedAnimId ~= nil,
+		})
+	end
+
+	if switched then
+		if self._currentAnimTrack then
+			self._currentAnimTrack:Stop(transitionTime)
+			self._currentAnimTrack:Destroy()
+			self._currentAnimTrack = nil
+		end
+
+		self:_destroyAnimationObject(self._currentAnimInstance, self._currentAnimIsTransient)
+		self._currentAnimInstance = nil
+		self._currentAnimIsTransient = false
+		self._currentAnimSpeed = 1.0
+
+		self._currentAnimTrack = humanoid:LoadAnimation(anim)
+		self._currentAnimTrack.Priority = Enum.AnimationPriority.Core
+		self._currentAnimTrack:Play(transitionTime)
+
+		self._currentAnim = animName
+		self._currentAnimInstance = anim
+		self._currentAnimIsTransient = selected.transient == true
+
+		if self._currentAnimKeyframeHandler then
+			self._currentAnimKeyframeHandler:Disconnect()
+		end
+		self._currentAnimKeyframeHandler = self._currentAnimTrack.KeyframeReached:Connect(function(frameName: string)
+			self:_keyFrameReachedFunc(frameName)
+		end)
+
+		if not silent then
+			self:_pushEvent("playAnimation", {
+				animName = animName,
+				animId = anim.AnimationId,
+				weightPool = if pool then self:_snapshotResolvedAnimationSets()[animName] else { { id = anim.AnimationId, weight = 1 } },
+				chosenWeight = selected.weight,
+				transitionTime = transitionTime,
+				speed = self._currentAnimSpeed,
+				priority = "Core",
+				looped = (self._emoteNames[animName] == true),
+			})
+		end
+	end
+
+	return self._currentAnimTrack, switched
+end
+
+function Recorder:_playToolAnimation(
+	animName: string,
+	transitionTime: number,
+	humanoid: Humanoid,
+	priority: Enum.AnimationPriority?,
+	forcedAnimId: string?,
+	silent: boolean?
+): (AnimationTrack?, boolean)
+	local selected, pool = self:_chooseAnimation(animName, forcedAnimId)
+	if not selected or not selected.anim then
+		return nil, false
+	end
+
+	local anim = selected.anim
+	local switched = anim ~= self._toolAnimInstance
+
+	if switched or forcedAnimId ~= nil or self._currentToolAnimName ~= animName then
+		self:_pushTrace("playToolAnimation_request", {
+			animName = animName,
+			animId = anim.AnimationId,
+			transitionTime = transitionTime,
+			switch = switched,
+			forced = forcedAnimId ~= nil,
+			priority = priorityToName(priority),
+		})
+	end
+
+	if switched then
+		if self._toolAnimTrack then
+			self._toolAnimTrack:Stop()
+			self._toolAnimTrack:Destroy()
+			self._toolAnimTrack = nil
+			transitionTime = 0
+		end
+
+		self:_destroyAnimationObject(self._toolAnimInstance, self._currentToolAnimIsTransient)
+		self._toolAnimInstance = nil
+		self._currentToolAnimIsTransient = false
+
+		self._toolAnimTrack = humanoid:LoadAnimation(anim)
+		if priority then
+			self._toolAnimTrack.Priority = priority
+		end
+		self._toolAnimTrack:Play(transitionTime)
+
+		self._currentToolAnimName = animName
+		self._toolAnimInstance = anim
+		self._currentToolAnimIsTransient = selected.transient == true
+
+		if self._currentToolAnimKeyframeHandler then
+			self._currentToolAnimKeyframeHandler:Disconnect()
+		end
+		self._currentToolAnimKeyframeHandler = self._toolAnimTrack.KeyframeReached:Connect(function(frameName: string)
+			self:_toolKeyFrameReachedFunc(frameName)
+		end)
+
+		if not silent then
+			self:_pushEvent("playToolAnimation", {
+				animName = animName,
+				animId = anim.AnimationId,
+				weightPool = if pool then self:_snapshotResolvedAnimationSets()[animName] else { { id = anim.AnimationId, weight = 1 } },
+				chosenWeight = selected.weight,
+				transitionTime = transitionTime,
+				priority = priorityToName(priority),
+				speed = 1,
+				signal = self._toolAnimSignal,
+			})
+		end
+	end
+
+	return self._toolAnimTrack, switched
+end
+
+function Recorder:_keyFrameReachedFunc(frameName: string)
+	if self._playing then
+		return
+	end
+
+	self:_pushTrace("keyframe", {
+		animName = self._currentAnim,
+		frame = frameName,
+	})
+
+	if frameName == "End" then
+		local repeatAnim = self._currentAnim
+		if self._emoteNames[repeatAnim] ~= nil and self._emoteNames[repeatAnim] == false then
+			repeatAnim = "idle"
+		end
+
+		local animSpeed = self._currentAnimSpeed
+		if self._humanoid then
+			self:_playAnimation(repeatAnim, 0, self._humanoid)
+			self:_setAnimationSpeed(animSpeed)
+		end
+	end
+end
+
+function Recorder:_toolKeyFrameReachedFunc(frameName: string)
+	if self._playing then
+		return
+	end
+
+	self:_pushTrace("tool_keyframe", {
+		animName = self._currentToolAnimName,
+		frame = frameName,
+	})
+
+	if frameName == "End" and self._humanoid then
+		self:_playToolAnimation(
+			self._currentToolAnimName,
+			0,
+			self._humanoid,
+			Enum.AnimationPriority.Idle
+		)
+	end
+end
+
+function Recorder:_setPose(newPose: string, payload: { [string]: any }?)
+	if self._pose == newPose then
+		return
+	end
+	self._pose = newPose
+	self:_pushEvent("pose", shallowCopy(payload or {
+		value = newPose,
+	}))
+end
+
+function Recorder:_traceHumanoidSignal(signalName: string, payload: { [string]: any }?)
+	self:_pushTrace("humanoid_signal", shallowCopy(payload or {
+		name = signalName,
+	}))
+end
+
+function Recorder:_getRootMotionCFrame(): CFrame?
+	local rootPart = self._rootPart
+	if rootPart then
+		return rootPart:GetPivot()
+	end
+
+	local humanoid = self._humanoid
+	if humanoid and humanoid.RootPart then
+		return humanoid.RootPart:GetPivot()
+	end
+
+	local character = self._character
+	if character then
+		return character:GetPivot()
+	end
+
+	return nil
+end
+
+function Recorder:_pivotToRootPartCFrame(targetPivot: CFrame): CFrame
+	return targetPivot * getPivotOffsetInverse(self._rootPart)
+end
+
+function Recorder:_hasRootMotionChanged(rootCf: CFrame, force: boolean?): boolean
+	if force or not self._lastRecordedRootCFrame then
+		return true
+	end
+
+	return cframeComponentDelta(self._lastRecordedRootCFrame, rootCf) > ROOT_SAMPLE_EPSILON
+end
+
+function Recorder:_recordCurrentAnimationState()
+	if self._state ~= "recording" or self._playing or not self._humanoid then
+		return
+	end
+
+	if self._currentAnimTrack and self._currentAnimInstance and self._currentAnim ~= "" then
+		self:_pushEvent("playAnimation", {
+			animName = self._currentAnim,
+			animId = self._currentAnimInstance.AnimationId,
+			weightPool = self:_snapshotResolvedAnimationSets()[self._currentAnim] or { { id = self._currentAnimInstance.AnimationId, weight = 1 } },
+			chosenWeight = 1,
+			transitionTime = 0,
+			speed = self._currentAnimSpeed,
+			priority = priorityToName(self._currentAnimTrack.Priority),
+			looped = self._currentAnimTrack.Looped or (self._emoteNames[self._currentAnim] == true),
+		})
+	end
+
+	if self._toolAnimTrack and self._toolAnimInstance and self._currentToolAnimName ~= "" then
+		self:_pushEvent("playToolAnimation", {
+			animName = self._currentToolAnimName,
+			animId = self._toolAnimInstance.AnimationId,
+			weightPool = self:_snapshotResolvedAnimationSets()[self._currentToolAnimName] or { { id = self._toolAnimInstance.AnimationId, weight = 1 } },
+			chosenWeight = 1,
+			transitionTime = 0,
+			priority = priorityToName(self._toolAnimTrack.Priority),
+			speed = 1,
+			signal = self._toolAnimSignal,
+		})
+	elseif self._toolAnimSignal ~= "None" then
+		self:_pushEvent("tool_anim_signal", {
+			value = self._toolAnimSignal,
+		})
+	end
+end
+
+function Recorder:_recordRootMotion(force: boolean?)
+	if self._state ~= "recording" or self._playing then
+		return
+	end
+
+	local rootCf = self:_getRootMotionCFrame()
+	if not rootCf or not self:_hasRootMotionChanged(rootCf, force) then
+		return
+	end
+
+	self:_pushEvent(ROOT_MOTION_KIND, encodeCFrame(rootCf))
+	self._lastRecordedRootCFrame = rootCf
+end
+
+function Recorder:_getTrackSpeed(track: AnimationTrack?): number
+	if not track then
+		return 1
+	end
+
+	local ok, speed = pcall(function()
+		return track.Speed
+	end)
+	if ok and typeof(speed) == "number" then
+		return speed
+	end
+
+	return 1
+end
+
+function Recorder:_setToolAnimationSpeed(speed: number)
+	if not self._toolAnimTrack then
+		return
+	end
+
+	pcall(function()
+		self._toolAnimTrack:AdjustSpeed(speed)
+	end)
+end
+
+function Recorder:_seekTrackPosition(track: AnimationTrack?, position: number, allowLoop: boolean?)
+	if not track then
+		return
+	end
+
+	local targetPosition = math.max(0, position)
+	local okLength, trackLength = pcall(function()
+		return track.Length
+	end)
+	if okLength and typeof(trackLength) == "number" and trackLength > 0 then
+		if allowLoop then
+			targetPosition = targetPosition % trackLength
+		else
+			targetPosition = math.clamp(targetPosition, 0, math.max(trackLength - 0.001, 0))
+		end
+	end
+
+	pcall(function()
+		track.TimePosition = targetPosition
+	end)
+end
+
+function Recorder:_sampleRootMotionAtTime(rootMotionEvents: { any }, elapsed: number): (CFrame?, number)
+	local count = #rootMotionEvents
+	if count <= 0 then
+		return nil, 0
+	end
+
+	if count == 1 then
+		return decodeCFrame(rootMotionEvents[1]), 1
+	end
+
+	local idx = 1
+	while idx < count and elapsed > (tonumber(rootMotionEvents[idx + 1].t) or 0) do
+		idx += 1
+	end
+
+	local currentFrame = rootMotionEvents[idx]
+	local nextFrame = rootMotionEvents[math.min(idx + 1, count)]
+
+	if idx >= count then
+		return decodeCFrame(currentFrame), idx
+	end
+
+	local currentTime = tonumber(currentFrame.t) or 0
+	local nextTime = tonumber(nextFrame.t) or currentTime
+
+	if nextTime <= currentTime then
+		return decodeCFrame(nextFrame), math.min(idx + 1, count)
+	end
+
+	local alpha = math.clamp((elapsed - currentTime) / (nextTime - currentTime), 0, 1)
+	return decodeCFrame(currentFrame):Lerp(decodeCFrame(nextFrame), alpha), idx
+end
+
+function Recorder:_getSessionEndTime(session: any?): number
+	if not session then
+		return 0
+	end
+
+	local maxTime = 0
+	for _, ev in ipairs(session.events or {}) do
+		maxTime = math.max(maxTime, tonumber(ev.t) or 0)
+	end
+	for _, ev in ipairs(session.trace or {}) do
+		maxTime = math.max(maxTime, tonumber(ev.t) or 0)
+	end
+
+	return maxTime
+end
+
+function Recorder:_truncateLiveSessionAtTime(cutoffTime: number)
+	if not self._live then
+		return
+	end
+
+	local trimmedEvents = {}
+	local trimmedTrace = {}
+	local epsilon = 0.000001
+	local maxSeq = 0
+
+	for _, ev in ipairs(self._live.events) do
+		if (tonumber(ev.t) or 0) <= cutoffTime + epsilon then
+			table.insert(trimmedEvents, ev)
+			maxSeq = math.max(maxSeq, tonumber(ev.seq) or 0)
+		end
+	end
+
+	for _, ev in ipairs(self._live.trace) do
+		if (tonumber(ev.t) or 0) <= cutoffTime + epsilon then
+			table.insert(trimmedTrace, ev)
+			maxSeq = math.max(maxSeq, tonumber(ev.seq) or 0)
+		end
+	end
+
+	self._live.events = trimmedEvents
+	self._live.trace = trimmedTrace
+	self._eventSeq = maxSeq
+
+	local _, rootMotionEvents = self:_splitReplayEvents(self._live)
+	local sampledRoot = self:_sampleRootMotionAtTime(rootMotionEvents, cutoffTime)
+	if sampledRoot then
+		self._lastRecordedRootCFrame = sampledRoot
+	else
+		self._lastRecordedRootCFrame = nil
+	end
+end
+
+function Recorder:_updateStopPhysicsTarget(targetCFrame: CFrame)
+	local mover = self._stopMover
+	local rootPart = self._rootPart
+	if not mover or not rootPart then
+		return
+	end
+
+	local targetRootPartCFrame = self:_pivotToRootPartCFrame(targetCFrame)
+	mover.alignPosition.Position = targetRootPartCFrame.Position
+	mover.alignOrientation.CFrame = targetRootPartCFrame.Rotation
+	mover.vectorForce.Force = Vector3.new(0, rootPart.AssemblyMass * Workspace.Gravity, 0)
+end
+
+function Recorder:_disableStopPhysics(restoreVelocity: boolean?)
+	local mover = self._stopMover
+	if not mover then
+		return
+	end
+
+	local humanoid = mover.humanoid
+	if humanoid and humanoid.Parent then
+		humanoid.EvaluateStateMachine = mover.restoreEvaluateStateMachine
+		humanoid.AutoRotate = mover.restoreAutoRotate
+	end
+
+	local rootPart = self._rootPart
+	if rootPart and rootPart.Parent then
+		if restoreVelocity then
+			rootPart.AssemblyLinearVelocity = self._stopStoredLinearVelocity
+			rootPart.AssemblyAngularVelocity = self._stopStoredAngularVelocity
+		else
+			rootPart.AssemblyLinearVelocity = Vector3.zero
+			rootPart.AssemblyAngularVelocity = Vector3.zero
+		end
+	end
+
+	local objects = {
+		mover.vectorForce,
+		mover.alignOrientation,
+		mover.alignPosition,
+		mover.attachment,
+	}
+	for _, obj in ipairs(objects) do
+		if obj then
+			obj:Destroy()
+		end
+	end
+
+	self._stopMover = nil
+end
+
+function Recorder:_enableStopPhysics(initialCFrame: CFrame?)
+	local humanoid = self._humanoid
+	local rootPart = self._rootPart
+
+	if not humanoid or not rootPart then
+		return false
+	end
+
+	self:_disableStopPhysics(false)
+
+	self._stopStoredLinearVelocity = rootPart.AssemblyLinearVelocity
+	self._stopStoredAngularVelocity = rootPart.AssemblyAngularVelocity
+
+	local attachment = Instance.new("Attachment")
+	attachment.Name = "HumanoidAnimRecorderStopAttachment"
+	attachment.Parent = rootPart
+
+	local alignPosition = Instance.new("AlignPosition")
+	alignPosition.Name = "HumanoidAnimRecorderStopAlignPosition"
+	alignPosition.Attachment0 = attachment
+	alignPosition.Mode = Enum.PositionAlignmentMode.OneAttachment
+	alignPosition.ApplyAtCenterOfMass = true
+	alignPosition.ReactionForceEnabled = false
+	alignPosition.RigidityEnabled = false
+	alignPosition.MaxForce = PLAYBACK_ALIGN_MAX_FORCE
+	alignPosition.MaxVelocity = PLAYBACK_ALIGN_MAX_VELOCITY
+	alignPosition.Responsiveness = PLAYBACK_ALIGN_RESPONSIVENESS
+	local initialRootPartCFrame = self:_pivotToRootPartCFrame(initialCFrame or rootPart:GetPivot())
+	alignPosition.Position = initialRootPartCFrame.Position
+	alignPosition.Parent = rootPart
+
+	local alignOrientation = Instance.new("AlignOrientation")
+	alignOrientation.Name = "HumanoidAnimRecorderStopAlignOrientation"
+	alignOrientation.Attachment0 = attachment
+	alignOrientation.Mode = Enum.OrientationAlignmentMode.OneAttachment
+	alignOrientation.ReactionTorqueEnabled = false
+	alignOrientation.RigidityEnabled = false
+	alignOrientation.MaxTorque = PLAYBACK_ALIGN_MAX_TORQUE
+	alignOrientation.MaxAngularVelocity = PLAYBACK_ALIGN_MAX_ANGULAR_VELOCITY
+	alignOrientation.Responsiveness = PLAYBACK_ALIGN_RESPONSIVENESS
+	alignOrientation.CFrame = initialRootPartCFrame.Rotation
+	alignOrientation.Parent = rootPart
+
+	local vectorForce = Instance.new("VectorForce")
+	vectorForce.Name = "HumanoidAnimRecorderStopVectorForce"
+	vectorForce.Attachment0 = attachment
+	vectorForce.RelativeTo = Enum.ActuatorRelativeTo.World
+	vectorForce.ApplyAtCenterOfMass = true
+	vectorForce.Force = Vector3.new(0, rootPart.AssemblyMass * Workspace.Gravity, 0)
+	vectorForce.Parent = rootPart
+
+	local restoreEvaluateStateMachine = humanoid.EvaluateStateMachine
+	local restoreAutoRotate = humanoid.AutoRotate
+
+	humanoid.EvaluateStateMachine = false
+	humanoid.AutoRotate = false
+
+	rootPart.AssemblyLinearVelocity = Vector3.zero
+	rootPart.AssemblyAngularVelocity = Vector3.zero
+
+	self._stopMover = {
+		humanoid = humanoid,
+		restoreEvaluateStateMachine = restoreEvaluateStateMachine,
+		restoreAutoRotate = restoreAutoRotate,
+		attachment = attachment,
+		alignPosition = alignPosition,
+		alignOrientation = alignOrientation,
+		vectorForce = vectorForce,
+	}
+
+	return true
+end
+
+function Recorder:_applyStopPreview(targetTime: number): boolean
+	if not self._live or not self._humanoid then
+		return false
+	end
+
+	local replayEvents, rootMotionEvents = self:_splitReplayEvents(self._live)
+	local sessionEndTime = self:_getSessionEndTime(self._live)
+	targetTime = math.clamp(targetTime, 0, sessionEndTime)
+
+	self:_stopAllAnimations(true, 0)
+	self:_stopToolAnimations(true)
+	self._toolAnimSignal = "None"
+	self._pose = "Standing"
+	self._currentAnimSpeed = 1.0
+
+	local mainState = {
+		track = nil,
+		speed = 1.0,
+		position = 0.0,
+		lastTime = 0.0,
+		allowLoop = false,
+	}
+	local toolState = {
+		track = nil,
+		speed = 1.0,
+		position = 0.0,
+		lastTime = 0.0,
+		allowLoop = false,
+	}
+
+	local function advanceState(stateTable, untilTime)
+		if not stateTable.track then
+			return
+		end
+		local delta = math.max(0, untilTime - (stateTable.lastTime or 0))
+		stateTable.position += delta * (stateTable.speed or 1)
+		stateTable.lastTime = untilTime
+	end
+
+	for _, ev in ipairs(replayEvents) do
+		local evTime = tonumber(ev.t) or 0
+		if evTime > targetTime then
+			break
+		end
+
+		local kind = ev.kind
+		if kind == "session_start" then
+			self._pose = ev.initialPose or "Standing"
+
+		elseif kind == "pose" then
+			self._pose = ev.value or self._pose
+
+		elseif kind == "playAnimation" then
+			local track = self:_playAnimation(
+				ev.animName or "idle",
+				tonumber(ev.transitionTime) or 0,
+				self._humanoid :: Humanoid,
+				ev.animId,
+				true
+			)
+			mainState.track = track
+			mainState.speed = tonumber(ev.speed) or 1
+			mainState.position = 0
+			mainState.lastTime = evTime
+			mainState.allowLoop = ev.looped == true
+			self:_setAnimationSpeed(mainState.speed, true)
+
+		elseif kind == "speed" then
+			if ev.target == "main" then
+				advanceState(mainState, evTime)
+				mainState.speed = tonumber(ev.value) or 1
+				self:_setAnimationSpeed(mainState.speed, true)
+			end
+
+		elseif kind == "stopAnimation" then
+			advanceState(mainState, evTime)
+			self:_stopAllAnimations(true, tonumber(ev.transitionTime) or 0)
+			mainState.track = nil
+
+		elseif kind == "playToolAnimation" then
+			self._toolAnimSignal = ev.signal or self._toolAnimSignal
+			local track = self:_playToolAnimation(
+				ev.animName or "toolnone",
+				tonumber(ev.transitionTime) or 0,
+				self._humanoid :: Humanoid,
+				self:_parsePriority(ev.priority),
+				ev.animId,
+				true
+			)
+			toolState.track = track
+			toolState.speed = tonumber(ev.speed) or 1
+			toolState.position = 0
+			toolState.lastTime = evTime
+			toolState.allowLoop = false
+			self:_setToolAnimationSpeed(toolState.speed)
+
+		elseif kind == "stopToolAnimation" then
+			advanceState(toolState, evTime)
+			self:_stopToolAnimations(true)
+			toolState.track = nil
+
+		elseif kind == "tool_anim_signal" then
+			self._toolAnimSignal = ev.value or "None"
+		end
+	end
+
+	advanceState(mainState, targetTime)
+	advanceState(toolState, targetTime)
+
+	if mainState.track then
+		self:_seekTrackPosition(mainState.track, mainState.position, mainState.allowLoop)
+	end
+	if toolState.track then
+		self:_seekTrackPosition(toolState.track, toolState.position, toolState.allowLoop)
+	end
+
+	self._stopStoredMainSpeed = mainState.track and mainState.speed or self._currentAnimSpeed
+	self._stopStoredToolSpeed = toolState.track and toolState.speed or self:_getTrackSpeed(self._toolAnimTrack)
+
+	if self._currentAnimTrack then
+		self._currentAnimTrack:AdjustSpeed(0)
+	end
+	if self._toolAnimTrack then
+		self._toolAnimTrack:AdjustSpeed(0)
+	end
+
+	local sampledRoot, rootFrame = self:_sampleRootMotionAtTime(rootMotionEvents, targetTime)
+	if sampledRoot then
+		if self._character then
+			self._character:PivotTo(sampledRoot)
+		elseif self._rootPart then
+			self._rootPart:PivotTo(self:_pivotToRootPartCFrame(sampledRoot))
+		end
+		self:_updateStopPhysicsTarget(sampledRoot)
+		self._lastRecordedRootCFrame = sampledRoot
+		self._stopPreviewFrame = math.max(rootFrame, 1)
+	else
+		self._stopPreviewFrame = 1
+	end
+
+	self._stopPreviewTime = targetTime
+	self._stopResumeTruncateTime = targetTime
+	return true
+end
+
+function Recorder:_enterStopMode()
+	if self._state ~= "recording" or not self._live then
+		return false, "not_recording"
+	end
+
+	local currentTime = math.max(0, os.clock() - self._recordStartClock)
+	self:_recordRootMotion(true)
+	self:_pushTrace("stop_enabled", {
+		frame = self._stopPreviewFrame,
+		t = currentTime,
+	})
+
+	local currentRoot = self:_getRootMotionCFrame()
+	if currentRoot then
+		self:_enableStopPhysics(currentRoot)
+		self:_updateStopPhysicsTarget(currentRoot)
+	end
+
+	self._stopStoredMainSpeed = self._currentAnimSpeed
+	self._stopStoredToolSpeed = self:_getTrackSpeed(self._toolAnimTrack)
+
+	if self._currentAnimTrack then
+		self._currentAnimTrack:AdjustSpeed(0)
+	end
+	if self._toolAnimTrack then
+		self._toolAnimTrack:AdjustSpeed(0)
+	end
+
+	self._stopActive = true
+	self._stopPreviewTime = currentTime
+	self._stopResumeTruncateTime = currentTime
+	local _, rootMotionEvents = self:_splitReplayEvents(self._live)
+	local _, frameIndex = self:_sampleRootMotionAtTime(rootMotionEvents, currentTime)
+	self._stopPreviewFrame = math.max(frameIndex, 1)
+	self:_setState("stopped")
+	return true
+end
+
+function Recorder:_exitStopMode()
+	if self._state ~= "stopped" or not self._stopActive then
+		return false, "stop_not_active"
+	end
+
+	local resumeTime = self._stopResumeTruncateTime or self._stopPreviewTime or 0
+	self:_truncateLiveSessionAtTime(resumeTime)
+	self._savedSession = nil
+	self._savedDecoded = nil
+	self._recordStartClock = os.clock() - resumeTime
+	self._rootSampleAccumulator = 0
+	self._lastRecordedRootCFrame = nil
+
+	self._stopActive = false
+	self:_setState("recording")
+
+	if self._currentAnimTrack then
+		self._currentAnimTrack:AdjustSpeed(self._stopStoredMainSpeed)
+		self._currentAnimSpeed = self._stopStoredMainSpeed
+	end
+	if self._toolAnimTrack then
+		self._toolAnimTrack:AdjustSpeed(self._stopStoredToolSpeed)
+	end
+
+	self:_recordRootMotion(true)
+	self:_pushTrace("stop_disabled", {
+		frame = self._stopPreviewFrame,
+		t = resumeTime,
+	})
+
+	self:_disableStopPhysics(true)
+	return true
+end
+
+function Recorder:_getStopTargetTimeByFrame(delta: number): (number?, number?)
+	if not self._live then
+		return nil, nil
+	end
+
+	local _, rootMotionEvents = self:_splitReplayEvents(self._live)
+	local count = #rootMotionEvents
+	if count <= 0 then
+		return nil, nil
+	end
+
+	local nextFrame = math.clamp((self._stopPreviewFrame or 1) + delta, 1, count)
+	local ev = rootMotionEvents[nextFrame]
+	if not ev then
+		return nil, nil
+	end
+
+	return tonumber(ev.t) or 0, nextFrame
+end
+
+function Recorder:_goStopFrame(delta: number)
+	if self._state ~= "stopped" or not self._stopActive then
+		return false, "stop_not_active"
+	end
+
+	local targetTime, targetFrame = self:_getStopTargetTimeByFrame(delta)
+	if targetTime == nil or targetFrame == nil then
+		return false, "no_recording_data"
+	end
+
+	local ok = self:_applyStopPreview(targetTime)
+	if not ok then
+		return false, "preview_failed"
+	end
+
+	self._stopPreviewFrame = targetFrame
+	self._stopResumeTruncateTime = targetTime
+	return true, targetFrame
+end
+
+function Recorder:_disablePlaybackPhysics()
+	local mover = self._playbackMover
+	if not mover then
+		return
+	end
+
+	local humanoid = mover.humanoid
+	if humanoid and humanoid.Parent then
+		humanoid.EvaluateStateMachine = mover.restoreEvaluateStateMachine
+		humanoid.AutoRotate = mover.restoreAutoRotate
+	end
+
+	for part, oldCanCollide in pairs(mover.collisions) do
+		if part and part.Parent then
+			part.CanCollide = oldCanCollide
+		end
+	end
+
+	if self._rootPart and self._rootPart.Parent then
+		self._rootPart.AssemblyLinearVelocity = Vector3.zero
+		self._rootPart.AssemblyAngularVelocity = Vector3.zero
+	end
+
+	local objects = {
+		mover.vectorForce,
+		mover.alignOrientation,
+		mover.alignPosition,
+		mover.attachment,
+	}
+	for _, obj in ipairs(objects) do
+		if obj then
+			obj:Destroy()
+		end
+	end
+
+	self._playbackMover = nil
+	self._playbackMotionIndex = 1
+end
+
+function Recorder:_enablePlaybackPhysics(initialCFrame: CFrame?)
+	local humanoid = self._humanoid
+	local rootPart = self._rootPart
+
+	if not humanoid or not rootPart then
+		return false
+	end
+
+	self:_disablePlaybackPhysics()
+
+	local collisions = {}
+	for _, descendant in ipairs((self._character :: Model):GetDescendants()) do
+		if descendant:IsA("BasePart") then
+			collisions[descendant] = descendant.CanCollide
+			descendant.CanCollide = false
+		end
+	end
+
+	local attachment = Instance.new("Attachment")
+	attachment.Name = "HumanoidAnimRecorderPlaybackAttachment"
+	attachment.Parent = rootPart
+
+	local alignPosition = Instance.new("AlignPosition")
+	alignPosition.Name = "HumanoidAnimRecorderAlignPosition"
+	alignPosition.Attachment0 = attachment
+	alignPosition.Mode = Enum.PositionAlignmentMode.OneAttachment
+	alignPosition.ApplyAtCenterOfMass = true
+	alignPosition.ReactionForceEnabled = false
+	alignPosition.RigidityEnabled = false
+	alignPosition.MaxForce = PLAYBACK_ALIGN_MAX_FORCE
+	alignPosition.MaxVelocity = PLAYBACK_ALIGN_MAX_VELOCITY
+	alignPosition.Responsiveness = PLAYBACK_ALIGN_RESPONSIVENESS
+	local initialRootPartCFrame = self:_pivotToRootPartCFrame(initialCFrame or rootPart:GetPivot())
+	alignPosition.Position = initialRootPartCFrame.Position
+	alignPosition.Parent = rootPart
+
+	local alignOrientation = Instance.new("AlignOrientation")
+	alignOrientation.Name = "HumanoidAnimRecorderAlignOrientation"
+	alignOrientation.Attachment0 = attachment
+	alignOrientation.Mode = Enum.OrientationAlignmentMode.OneAttachment
+	alignOrientation.ReactionTorqueEnabled = false
+	alignOrientation.RigidityEnabled = false
+	alignOrientation.MaxTorque = PLAYBACK_ALIGN_MAX_TORQUE
+	alignOrientation.MaxAngularVelocity = PLAYBACK_ALIGN_MAX_ANGULAR_VELOCITY
+	alignOrientation.Responsiveness = PLAYBACK_ALIGN_RESPONSIVENESS
+	alignOrientation.CFrame = initialRootPartCFrame.Rotation
+	alignOrientation.Parent = rootPart
+
+	local vectorForce = Instance.new("VectorForce")
+	vectorForce.Name = "HumanoidAnimRecorderVectorForce"
+	vectorForce.Attachment0 = attachment
+	vectorForce.RelativeTo = Enum.ActuatorRelativeTo.World
+	vectorForce.ApplyAtCenterOfMass = true
+	vectorForce.Force = Vector3.new(0, rootPart.AssemblyMass * Workspace.Gravity, 0)
+	vectorForce.Parent = rootPart
+
+	local restoreEvaluateStateMachine = humanoid.EvaluateStateMachine
+	local restoreAutoRotate = humanoid.AutoRotate
+
+	humanoid.EvaluateStateMachine = false
+	humanoid.AutoRotate = false
+
+	rootPart.AssemblyLinearVelocity = Vector3.zero
+	rootPart.AssemblyAngularVelocity = Vector3.zero
+
+	self._playbackMover = {
+		humanoid = humanoid,
+		restoreEvaluateStateMachine = restoreEvaluateStateMachine,
+		restoreAutoRotate = restoreAutoRotate,
+		collisions = collisions,
+		attachment = attachment,
+		alignPosition = alignPosition,
+		alignOrientation = alignOrientation,
+		vectorForce = vectorForce,
+	}
+
+	return true
+end
+
+function Recorder:_splitReplayEvents(session: any): ({ any }, { any })
+	local replayEvents = {}
+	local rootMotionEvents = {}
+
+	for _, ev in ipairs(session.events or {}) do
+		if ev.kind == ROOT_MOTION_KIND then
+			table.insert(rootMotionEvents, ev)
+		else
+			table.insert(replayEvents, ev)
+		end
+	end
+
+	return replayEvents, rootMotionEvents
+end
+
+function Recorder:_sampleRootMotion(rootMotionEvents: { any }, elapsed: number): CFrame?
+	local count = #rootMotionEvents
+	if count <= 0 then
+		return nil
+	end
+
+	if count == 1 then
+		return decodeCFrame(rootMotionEvents[1])
+	end
+
+	local idx = self._playbackMotionIndex
+	if idx < 1 then
+		idx = 1
+	elseif idx > count then
+		idx = count
+	end
+
+	while idx < count and elapsed > (tonumber(rootMotionEvents[idx + 1].t) or 0) do
+		idx += 1
+	end
+	self._playbackMotionIndex = idx
+
+	local currentFrame = rootMotionEvents[idx]
+	local nextFrame = rootMotionEvents[math.min(idx + 1, count)]
+
+	if idx >= count then
+		return decodeCFrame(currentFrame)
+	end
+
+	local currentTime = tonumber(currentFrame.t) or 0
+	local nextTime = tonumber(nextFrame.t) or currentTime
+
+	if nextTime <= currentTime then
+		return decodeCFrame(nextFrame)
+	end
+
+	local alpha = math.clamp((elapsed - currentTime) / (nextTime - currentTime), 0, 1)
+	return decodeCFrame(currentFrame):Lerp(decodeCFrame(nextFrame), alpha)
+end
+
+function Recorder:_applyPlaybackRootMotion(targetCFrame: CFrame)
+	local mover = self._playbackMover
+	local rootPart = self._rootPart
+	if not mover or not rootPart then
+		return
+	end
+
+	local targetRootPartCFrame = self:_pivotToRootPartCFrame(targetCFrame)
+	mover.alignPosition.Position = targetRootPartCFrame.Position
+	mover.alignOrientation.CFrame = targetRootPartCFrame.Rotation
+	mover.vectorForce.Force = Vector3.new(0, rootPart.AssemblyMass * Workspace.Gravity, 0)
+end
+
+function Recorder:_onRunning(speed: number)
+	if self:_isRuntimeSuppressed() or not self._humanoid then
+		return
+	end
+
+	self:_traceHumanoidSignal("Running", { speed = speed })
+
+	speed /= self:_getRigScale()
+
+	if speed > 0.01 then
+		self:_playAnimation("walk", 0.1, self._humanoid)
+		if self._currentAnimInstance and self._currentAnimInstance.AnimationId == "http://www.roblox.com/asset/?id=180426354" then
+			self:_setAnimationSpeed(speed / 14.5)
+		end
+		self:_setPose("Running", { value = "Running", speed = speed })
+	else
+		if self._emoteNames[self._currentAnim] == nil then
+			self:_playAnimation("idle", 0.1, self._humanoid)
+			self:_setPose("Standing", { value = "Standing", speed = speed })
+		end
+	end
+end
+
+function Recorder:_onDied()
+	if self:_isRuntimeSuppressed() then
+		return
+	end
+
+	self:_traceHumanoidSignal("Died", {})
+	self:_setPose("Dead", { value = "Dead" })
+end
+
+function Recorder:_onJumping()
+	if self:_isRuntimeSuppressed() or not self._humanoid then
+		return
+	end
+
+	self:_traceHumanoidSignal("Jumping", {})
+	self:_playAnimation("jump", 0.1, self._humanoid)
+	self._jumpAnimTime = self._jumpAnimDuration
+	self:_setPose("Jumping", { value = "Jumping" })
+end
+
+function Recorder:_onClimbing(speed: number)
+	if self:_isRuntimeSuppressed() or not self._humanoid then
+		return
+	end
+
+	self:_traceHumanoidSignal("Climbing", { speed = speed })
+
+	speed /= self:_getRigScale()
+	self:_playAnimation("climb", 0.1, self._humanoid)
+	self:_setAnimationSpeed(speed / 12.0)
+	self:_setPose("Climbing", { value = "Climbing", speed = speed })
+end
+
+function Recorder:_onGettingUp()
+	if self:_isRuntimeSuppressed() then
+		return
+	end
+
+	self:_traceHumanoidSignal("GettingUp", {})
+	self:_setPose("GettingUp", { value = "GettingUp" })
+end
+
+function Recorder:_onFreeFall()
+	if self:_isRuntimeSuppressed() or not self._humanoid then
+		return
+	end
+
+	self:_traceHumanoidSignal("FreeFall", {})
+
+	if self._jumpAnimTime <= 0 then
+		self:_playAnimation("fall", self._fallTransitionTime, self._humanoid)
+	end
+	self:_setPose("FreeFall", { value = "FreeFall" })
+end
+
+function Recorder:_onFallingDown()
+	if self:_isRuntimeSuppressed() then
+		return
+	end
+
+	self:_traceHumanoidSignal("FallingDown", {})
+	self:_setPose("FallingDown", { value = "FallingDown" })
+end
+
+function Recorder:_onSeated()
+	if self:_isRuntimeSuppressed() then
+		return
+	end
+
+	self:_traceHumanoidSignal("Seated", {})
+	self:_setPose("Seated", { value = "Seated" })
+end
+
+function Recorder:_onPlatformStanding()
+	if self:_isRuntimeSuppressed() then
+		return
+	end
+
+	self:_traceHumanoidSignal("PlatformStanding", {})
+	self:_setPose("PlatformStanding", { value = "PlatformStanding" })
+end
+
+function Recorder:_onSwimming(speed: number)
+	if self:_isRuntimeSuppressed() then
+		return
+	end
+
+	self:_traceHumanoidSignal("Swimming", { speed = speed })
+
+	if speed > 0 then
+		self:_setPose("Running", { value = "Running", speed = speed })
+	else
+		self:_setPose("Standing", { value = "Standing", speed = speed })
+	end
+end
+
+function Recorder:_getTool(): Tool?
+	local character = self._character
+	if not character then
+		return nil
+	end
+
+	for _, kid in ipairs(character:GetChildren()) do
+		if kid:IsA("Tool") then
+			return kid
+		end
+	end
+
+	return nil
+end
+
+function Recorder:_getToolAnim(tool: Tool): StringValue?
+	for _, c in ipairs(tool:GetChildren()) do
+		if c:IsA("StringValue") and c.Name == "toolanim" then
+			return c
+		end
+	end
+	return nil
+end
+
+function Recorder:_animateTool()
+	if not self._humanoid then
+		return
+	end
+
+	if self._toolAnimSignal == "None" then
+		self:_playToolAnimation(
+			"toolnone",
+			self._toolTransitionTime,
+			self._humanoid,
+			Enum.AnimationPriority.Idle
+		)
+		return
+	end
+
+	if self._toolAnimSignal == "Slash" then
+		self:_playToolAnimation(
+			"toolslash",
+			0,
+			self._humanoid,
+			Enum.AnimationPriority.Action
+		)
+		return
+	end
+
+	if self._toolAnimSignal == "Lunge" then
+		self:_playToolAnimation(
+			"toollunge",
+			0,
+			self._humanoid,
+			Enum.AnimationPriority.Action
+		)
+		return
+	end
+end
+
+function Recorder:_moveSit()
+	if not self._rightShoulder or not self._leftShoulder or not self._rightHip or not self._leftHip then
+		return
+	end
+
+	self._rightShoulder.MaxVelocity = 0.15
+	self._leftShoulder.MaxVelocity = 0.15
+	self._rightShoulder:SetDesiredAngle(math.pi / 2)
+	self._leftShoulder:SetDesiredAngle(-math.pi / 2)
+	self._rightHip:SetDesiredAngle(math.pi / 2)
+	self._leftHip:SetDesiredAngle(-math.pi / 2)
+end
+
+function Recorder:_move(timeNow: number)
+	if not self._humanoid then
+		return
+	end
+
+	local amplitude = 1
+	local frequency = 1
+	local deltaTime = timeNow - self._lastTick
+	self._lastTick = timeNow
+
+	local climbFudge = 0
+	local setAngles = false
+
+	if self._jumpAnimTime > 0 then
+		self._jumpAnimTime -= deltaTime
+	end
+
+	if self._pose == "FreeFall" and self._jumpAnimTime <= 0 then
+		self:_playAnimation("fall", self._fallTransitionTime, self._humanoid)
+	elseif self._pose == "Seated" then
+		self:_playAnimation("sit", 0.5, self._humanoid)
+		return
+	elseif self._pose == "Running" then
+		self:_playAnimation("walk", 0.1, self._humanoid)
+	elseif
+		self._pose == "Dead"
+		or self._pose == "GettingUp"
+		or self._pose == "FallingDown"
+		or self._pose == "PlatformStanding"
+	then
+		self:_stopAllAnimations()
+		amplitude = 0.1
+		frequency = 1
+		setAngles = true
+	end
+
+	if setAngles and self._rightShoulder and self._leftShoulder and self._rightHip and self._leftHip then
+		local desiredAngle = amplitude * math.sin(timeNow * frequency)
+
+		self._rightShoulder:SetDesiredAngle(desiredAngle + climbFudge)
+		self._leftShoulder:SetDesiredAngle(desiredAngle - climbFudge)
+		self._rightHip:SetDesiredAngle(-desiredAngle)
+		self._leftHip:SetDesiredAngle(-desiredAngle)
+	end
+
+	local tool = self:_getTool()
+	if tool and tool:FindFirstChild("Handle") then
+		local animStringValueObject = self:_getToolAnim(tool)
+
+		if animStringValueObject then
+			self._toolAnimSignal = animStringValueObject.Value
+			animStringValueObject.Parent = nil
+			self._toolAnimTime = timeNow + 0.3
+
+			self:_pushEvent("tool_anim_signal", {
+				value = self._toolAnimSignal,
+				tool = tool.Name,
+			})
+		end
+
+		if timeNow > self._toolAnimTime then
+			self._toolAnimTime = 0
+			self._toolAnimSignal = "None"
+		end
+
+		self:_animateTool()
+	else
+		self:_stopToolAnimations()
+		self._toolAnimSignal = "None"
+		self._toolAnimTime = 0
+	end
+end
+
+function Recorder:_step(dt: number)
+	if self:_isRuntimeSuppressed() then
+		return
+	end
+
+	if not self._character or not self._humanoid then
+		return
+	end
+
+	self._simTime += dt
+	self:_move(self._simTime)
+
+	if self._state == "recording" then
+		self._rootSampleAccumulator += dt
+		while self._rootSampleAccumulator >= ROOT_SAMPLE_RATE do
+			self._rootSampleAccumulator -= ROOT_SAMPLE_RATE
+			self:_recordRootMotion(false)
+		end
+	end
+end
+
+function Recorder:_parseChatEmote(msg: string): string?
+	if msg == "/e dance" then
+		return DANCES[math.random(1, #DANCES)]
+	end
+	if string.sub(msg, 1, 3) == "/e " then
+		return string.sub(msg, 4)
+	end
+	if string.sub(msg, 1, 7) == "/emote " then
+		return string.sub(msg, 8)
+	end
+	return nil
+end
+
+function Recorder:_hookEmoteInterfaces()
+	if LOCAL_PLAYER then
+		self._chatConn = LOCAL_PLAYER.Chatted:Connect(function(msg: string)
+			if self:_isRuntimeSuppressed() then
+				return
+			end
+
+			local emote = self:_parseChatEmote(msg)
+			if emote then
+				self:_playEmote(emote)
+			end
+		end)
+	end
+
+	local bindable = self._moduleScript:FindFirstChild("PlayEmote")
+	if bindable and bindable:IsA("BindableFunction") then
+		self._playEmoteBindable = bindable
+		bindable.OnInvoke = function(emote: string)
+			return self:_playEmote(emote)
+		end
+	end
+end
+
+function Recorder:_playEmote(emote: string): (boolean, AnimationTrack?)
+	if not self._humanoid then
+		return false, nil
+	end
+	if self:_isRuntimeSuppressed() then
+		return false, nil
+	end
+
+	if emote == "dance" then
+		emote = DANCES[math.random(1, #DANCES)]
+	end
+
+	self:_pushTrace("emote_request", {
+		emote = emote,
+	})
+
+	if self._pose ~= "Standing" then
+		return false, nil
+	end
+
+	if self._emoteNames[emote] ~= nil then
+		local track = self:_playAnimation(emote, 0.1, self._humanoid)
+		self:_pushEvent("emote", {
+			emote = emote,
+		})
+		return true, track
+	end
+
+	return false, nil
+end
+
+function Recorder:_connectHumanoidEvents()
+	if not self._humanoid then
+		return
+	end
+
+	self._runningConn = self._humanoid.Running:Connect(function(speed: number)
+		self:_onRunning(speed)
+	end)
+
+	self._diedConn = self._humanoid.Died:Connect(function()
+		self:_onDied()
+	end)
+
+	self._jumpingConn = self._humanoid.Jumping:Connect(function(active: boolean)
+		if active then
+			self:_onJumping()
+		end
+	end)
+
+	self._climbingConn = self._humanoid.Climbing:Connect(function(speed: number)
+		self:_onClimbing(speed)
+	end)
+
+	self._gettingUpConn = self._humanoid.GettingUp:Connect(function()
+		self:_onGettingUp()
+	end)
+
+	self._freeFallConn = self._humanoid.FreeFalling:Connect(function(active: boolean)
+		if active then
+			self:_onFreeFall()
+		end
+	end)
+
+	self._fallingDownConn = self._humanoid.FallingDown:Connect(function(active: boolean)
+		if active then
+			self:_onFallingDown()
+		end
+	end)
+
+	self._seatedConn = self._humanoid.Seated:Connect(function(active: boolean)
+		if active then
+			self:_onSeated()
+		end
+	end)
+
+	self._platformStandingConn = self._humanoid.PlatformStanding:Connect(function(active: boolean)
+		if active then
+			self:_onPlatformStanding()
+		end
+	end)
+
+	self._swimmingConn = self._humanoid.Swimming:Connect(function(speed: number)
+		self:_onSwimming(speed)
+	end)
+
+	self._stateChangedConn = self._humanoid.StateChanged:Connect(function(oldState, newState)
+		if self:_isRuntimeSuppressed() then
+			return
+		end
+
+		self:_pushTrace("state_changed", {
+			from = tostring(oldState),
+			to = tostring(newState),
+		})
+
+		if newState == Enum.HumanoidStateType.Dead then
+			self:_onDied()
+		elseif newState == Enum.HumanoidStateType.Jumping then
+			self:_onJumping()
+		elseif newState == Enum.HumanoidStateType.Freefall then
+			self:_onFreeFall()
+		elseif newState == Enum.HumanoidStateType.Climbing then
+			self:_setPose("Climbing", { value = "Climbing" })
+		elseif newState == Enum.HumanoidStateType.Seated then
+			self:_onSeated()
+		elseif newState == Enum.HumanoidStateType.GettingUp then
+			self:_onGettingUp()
+		elseif newState == Enum.HumanoidStateType.FallingDown then
+			self:_onFallingDown()
+		elseif newState == Enum.HumanoidStateType.PlatformStanding then
+			self:_onPlatformStanding()
+		end
+	end)
+end
+
+function Recorder:_disconnectAll()
+	local conns = {
+		self._runningConn,
+		self._diedConn,
+		self._jumpingConn,
+		self._climbingConn,
+		self._gettingUpConn,
+		self._freeFallConn,
+		self._fallingDownConn,
+		self._seatedConn,
+		self._platformStandingConn,
+		self._swimmingConn,
+		self._stateChangedConn,
+		self._childAddedConn,
+		self._childRemovedConn,
+		self._heartbeatConn,
+		self._chatConn,
+	}
+
+	for _, conn in ipairs(conns) do
+		if conn then
+			conn:Disconnect()
+		end
+	end
+
+	self._runningConn = nil
+	self._diedConn = nil
+	self._jumpingConn = nil
+	self._climbingConn = nil
+	self._gettingUpConn = nil
+	self._freeFallConn = nil
+	self._fallingDownConn = nil
+	self._seatedConn = nil
+	self._platformStandingConn = nil
+	self._swimmingConn = nil
+	self._stateChangedConn = nil
+	self._childAddedConn = nil
+	self._childRemovedConn = nil
+	self._heartbeatConn = nil
+	self._chatConn = nil
+
+	if self._playEmoteBindable then
+		self._playEmoteBindable.OnInvoke = nil
+		self._playEmoteBindable = nil
+	end
+end
+
+
+function Recorder:_setState(newState: string)
+	self._state = newState
+	self.Status = newState
+end
+
+function Recorder:_bindCharacter(character: Model)
+	self:_disconnectAll()
+	self:_disablePlaybackPhysics()
+	self:_disableStopPhysics(false)
+	self:_stopAllAnimations(true, 0)
+	self:_stopToolAnimations(true)
+	self:_restoreDefaultAnimate()
+
+	self._character = character
+	self._torso = character:WaitForChild("Torso") :: BasePart
+	self._rootPart = character:WaitForChild("HumanoidRootPart") :: BasePart
+	self._rightShoulder = self._torso:WaitForChild("Right Shoulder") :: Motor6D
+	self._leftShoulder = self._torso:WaitForChild("Left Shoulder") :: Motor6D
+	self._rightHip = self._torso:WaitForChild("Right Hip") :: Motor6D
+	self._leftHip = self._torso:WaitForChild("Left Hip") :: Motor6D
+	self._neck = self._torso:WaitForChild("Neck") :: Motor6D
+	self._humanoid = character:WaitForChild("Humanoid") :: Humanoid
+	self._animator = self._humanoid:FindFirstChildOfClass("Animator")
+
+	self:_disableDefaultAnimate()
+
+	if self._animator then
+		for _, track in ipairs(self._animator:GetPlayingAnimationTracks()) do
+			track:Stop(0)
+			track:Destroy()
+		end
+	end
+
+	for name, fileList in pairs(self._animNames) do
+		self:_configureAnimationSet(name, fileList)
+	end
+
+	self._childAddedConn = self._moduleScript.ChildAdded:Connect(function(child: Instance)
+		self:_scriptChildModified(child)
+	end)
+
+	self._childRemovedConn = self._moduleScript.ChildRemoved:Connect(function(child: Instance)
+		self:_scriptChildModified(child)
+	end)
+
+	self:_connectHumanoidEvents()
+	self:_hookEmoteInterfaces()
+
+	self._heartbeatConn = RunService.Heartbeat:Connect(function(dt: number)
+		self:_step(dt)
+	end)
+
+	self._pose = "Standing"
+	self._simTime = 0
+	self._lastTick = 0
+	self._toolAnimSignal = "None"
+	self._toolAnimTime = 0
+	self._playing = false
+	self._stopActive = false
+	self._rootSampleAccumulator = 0
+	self._lastRecordedRootCFrame = nil
+	self._playbackMotionIndex = 1
+	self._stopPreviewFrame = 1
+	self._stopPreviewTime = 0
+	self._stopResumeTruncateTime = nil
+
+	if self._humanoid then
+		self:_playAnimation("idle", 0.1, self._humanoid)
+	end
+
+	self:_setState("idle")
+	return self
+end
+
+function Recorder:_getLocalCharacter(): Model?
+	if not LOCAL_PLAYER then
+		return nil
+	end
+
+	local character = LOCAL_PLAYER.Character
+	if character and character.Parent then
+		return character
+	end
+
+	local ok, loadedCharacter = pcall(function()
+		return LOCAL_PLAYER.CharacterAdded:Wait()
+	end)
+
+	if ok and loadedCharacter and loadedCharacter.Parent then
+		return loadedCharacter
+	end
+
+	return nil
+end
+
+function Recorder:_ensureCharacterBound(): boolean
+	local character = self:_getLocalCharacter()
+	if not character then
+		return false
+	end
+
+	local humanoid = self._humanoid
+	local rootPart = self._rootPart
+
+	local needsRebind = (
+		self._character ~= character
+		or humanoid == nil
+		or humanoid.Parent ~= character
+		or rootPart == nil
+		or rootPart.Parent ~= character
+		or self._heartbeatConn == nil
+	)
+
+	if needsRebind then
+		self:_bindCharacter(character)
+	end
+
+	return self._character ~= nil and self._humanoid ~= nil and self._rootPart ~= nil
+end
+
+function Recorder:_stopRecordingInternal()
+	if self._state ~= "recording" and not (self._state == "stopped" and self._stopActive) then
+		return false, "not_recording"
+	end
+
+	if self._state == "stopped" and self._stopActive then
+		local finalTime = self._stopResumeTruncateTime or self._stopPreviewTime or 0
+		self:_truncateLiveSessionAtTime(finalTime)
+		self._recordStartClock = os.clock() - finalTime
+		self._rootSampleAccumulator = 0
+		self._lastRecordedRootCFrame = nil
+		self:_setState("recording")
+		self:_recordRootMotion(true)
+		self._stopActive = false
+		if self._currentAnimTrack then
+			self._currentAnimTrack:AdjustSpeed(self._stopStoredMainSpeed)
+			self._currentAnimSpeed = self._stopStoredMainSpeed
+		end
+		if self._toolAnimTrack then
+			self._toolAnimTrack:AdjustSpeed(self._stopStoredToolSpeed)
+		end
+		self:_disableStopPhysics(false)
+	end
+
+	self:_recordRootMotion(true)
+	self:_pushEvent("session_stop", {
+		finalPose = self._pose,
+		currentAnim = self._currentAnim,
+		currentToolAnim = self._currentToolAnimName,
+	})
+	self:_setState("stopped")
+	return true
+end
+
+function Recorder:_stopPlaybackInternal()
+	if self._state ~= "playing" then
+		return false, "not_playing"
+	end
+
+	self._playing = false
+	self._playToken += 1
+	self:_setState("saved")
+
+	self:_disablePlaybackPhysics()
+	self:_stopAllAnimations(true, 0)
+	self:_stopToolAnimations(true)
+
+	if self._humanoid then
+		self:_playAnimation("idle", 0.1, self._humanoid)
+		self._pose = "Standing"
+	end
+
+	return true
+end
+
+function Recorder:_clearSessionData()
+	self._live = nil
+	self._savedSession = nil
+	self._savedDecoded = nil
+	self._recordStartClock = 0
+	self._eventSeq = 0
+	self._rootSampleAccumulator = 0
+	self._lastRecordedRootCFrame = nil
+	self._playbackMotionIndex = 1
+	self._stopActive = false
+	self._stopPreviewFrame = 1
+	self._stopPreviewTime = 0
+	self._stopResumeTruncateTime = nil
+	self._stopStoredLinearVelocity = Vector3.zero
+	self._stopStoredAngularVelocity = Vector3.zero
+	self._stopStoredMainSpeed = 1.0
+	self._stopStoredToolSpeed = 1.0
+end
+
+function Recorder:Record()
+	if self._state == "playing" then
+		return false, "playing"
+	end
+	if self._state == "recording" then
+		return false, "already_recording"
+	end
+	if self._state == "stopped" and self._stopActive then
+		return false, "stop_active"
+	end
+	if not self:_ensureCharacterBound() then
+		return false, "character_not_ready"
+	end
+
+	self:_disablePlaybackPhysics()
+	self:_disableStopPhysics(false)
+	self:_disableDefaultAnimate()
+	self._savedSession = nil
+	self._savedDecoded = nil
+
+	self._live = {
+		meta = {
+			rig = "R6",
+			scale = self:_getRigScale(),
+			startedAt = os.clock(),
+			replayVersion = 4,
+			module = "HumanoidAnimRecorder",
+			rootMotion = true,
+			rootSampleRate = ROOT_SAMPLE_RATE,
+		},
+		animationSets = self:_snapshotResolvedAnimationSets(),
+		events = {},
+		trace = {},
+	}
+
+	self._recordStartClock = os.clock()
+	self._eventSeq = 0
+	self._stopActive = false
+	self:_setState("recording")
+	self._rootSampleAccumulator = 0
+	self._lastRecordedRootCFrame = nil
+	self._stopPreviewFrame = 1
+	self._stopPreviewTime = 0
+	self._stopResumeTruncateTime = nil
+
+	self:_pushEvent("session_start", {
+		initialPose = self._pose,
+		currentAnim = self._currentAnim,
+		currentToolAnim = self._currentToolAnimName,
+	})
+
+	self:_recordCurrentAnimationState()
+	self:_recordRootMotion(true)
+
+	return true
+end
+
+function Recorder:Stop()
+	if self._state == "recording" then
+		return self:_enterStopMode()
+	end
+
+	if self._state == "stopped" and self._stopActive then
+		return self:_exitStopMode()
+	end
+
+	if self._state == "playing" then
+		return self:_stopPlaybackInternal()
+	end
+
+	return false, "nothing_to_stop"
+end
+
+function Recorder:goBack(frameCount: number)
+	local delta = math.floor(math.abs(tonumber(frameCount) or 0))
+	if delta <= 0 then
+		return false, "invalid_frame"
+	end
+
+	return self:_goStopFrame(-delta)
+end
+
+function Recorder:goFront(frameCount: number)
+	local delta = math.floor(math.abs(tonumber(frameCount) or 0))
+	if delta <= 0 then
+		return false, "invalid_frame"
+	end
+
+	return self:_goStopFrame(delta)
+end
+
+function Recorder:Save()
+	if self._state == "recording" or (self._state == "stopped" and self._stopActive) then
+		local ok, reason = self:_stopRecordingInternal()
+		if not ok then
+			return false, reason
+		end
+	end
+
+	if self._state == "saved" and self._savedSession then
+		return true, self._savedSession
+	end
+
+	if self._state ~= "stopped" or not self._live then
+		return false, "no_recording_data"
+	end
+
+	self._savedSession = HttpService:JSONEncode(self._live)
+	self._savedDecoded = self._live
+	self:_setState("saved")
+	return true, self._savedSession
+end
+
+function Recorder:_loadSavedString(savedString: string)
+	local ok, decoded = pcall(function()
+		return HttpService:JSONDecode(savedString)
+	end)
+
+	if not ok then
+		return false, "decode_failed"
+	end
+
+	self._savedSession = savedString
+	self._savedDecoded = decoded
+	self:_setState("saved")
+	return true, decoded
+end
+
+function Recorder:_parsePriority(priorityText: any): Enum.AnimationPriority
+	if typeof(priorityText) ~= "string" then
+		return Enum.AnimationPriority.Idle
+	end
+	return PRIORITY_BY_NAME[priorityText] or Enum.AnimationPriority.Idle
+end
+
+function Recorder:_waitUntilPlaybackOffset(startClock: number, targetOffset: number, token: number)
+	while self._playing and self._playToken == token do
+		local elapsed = os.clock() - startClock
+		local remaining = targetOffset - elapsed
+		if remaining <= 0 then
+			break
+		end
+		RunService.Heartbeat:Wait()
+	end
+end
+
+function Recorder:Play(savedString: string?)
+	if self._state == "recording" or (self._state == "stopped" and self._stopActive) then
+		local okStop, reason = self:_stopRecordingInternal()
+		if not okStop then
+			return false, reason
+		end
+	end
+
+	if self._state == "playing" then
+		return false, "already_playing"
+	end
+
+	if not self:_ensureCharacterBound() then
+		return false, "character_not_ready"
+	end
+
+	if savedString then
+		local okLoad = self:_loadSavedString(savedString)
+		if not okLoad then
+			return false, "decode_failed"
+		end
+	elseif self._state == "stopped" and self._live and not self._savedSession then
+		local okSave = self:Save()
+		if not okSave then
+			return false, "save_failed"
+		end
+	end
+
+	if not self._savedSession then
+		return false, "no_saved_data"
+	end
+	if not self._humanoid then
+		return false, "character_not_ready"
+	end
+
+	local session = self._savedDecoded
+	if session == nil then
+		local ok, decoded = pcall(function()
+			return HttpService:JSONDecode(self._savedSession :: string)
+		end)
+		if not ok then
+			return false, "decode_failed"
+		end
+		session = decoded
+		self._savedDecoded = decoded
+	end
+
+	local replayEvents, rootMotionEvents = self:_splitReplayEvents(session)
+	local initialRootCFrame = if #rootMotionEvents > 0 then decodeCFrame(rootMotionEvents[1]) else nil
+
+	self._playing = true
+	self:_setState("playing")
+	self._playToken += 1
+	local myToken = self._playToken
+
+	task.spawn(function()
+		self:_disablePlaybackPhysics()
+		self:_disableStopPhysics(false)
+		self:_stopAllAnimations(true, 0)
+		self:_stopToolAnimations(true)
+
+		if initialRootCFrame then
+			if self._character then
+				self._character:PivotTo(initialRootCFrame)
+			elseif self._rootPart then
+				self._rootPart:PivotTo(initialRootCFrame)
+			end
+
+			self:_enablePlaybackPhysics(initialRootCFrame)
+			self:_applyPlaybackRootMotion(initialRootCFrame)
+		end
+
+		local startClock = os.clock()
+
+		if #rootMotionEvents > 0 then
+			task.spawn(function()
+				while self._playing and self._playToken == myToken do
+					local elapsed = os.clock() - startClock
+					local sampled = self:_sampleRootMotion(rootMotionEvents, elapsed)
+					if sampled then
+						self:_applyPlaybackRootMotion(sampled)
+					end
+					RunService.Heartbeat:Wait()
+				end
+			end)
+		end
+
+		for _, ev in ipairs(replayEvents) do
+			if not self._playing or self._playToken ~= myToken then
+				break
+			end
+
+			self:_waitUntilPlaybackOffset(startClock, tonumber(ev.t) or 0, myToken)
+
+			if not self._playing or self._playToken ~= myToken then
+				break
+			end
+
+			local kind = ev.kind
+
+			if kind == "session_start" then
+				self._pose = ev.initialPose or "Standing"
+
+			elseif kind == "pose" then
+				self._pose = ev.value or self._pose
+
+			elseif kind == "speed" then
+				if ev.target == "main" then
+					self:_setAnimationSpeed(tonumber(ev.value) or 1, true)
+				end
+
+			elseif kind == "playAnimation" then
+				self:_playAnimation(
+					ev.animName or "idle",
+					tonumber(ev.transitionTime) or 0,
+					self._humanoid :: Humanoid,
+					ev.animId,
+					true
+				)
+				if ev.speed ~= nil then
+					self:_setAnimationSpeed(tonumber(ev.speed) or 1, true)
+				end
+
+			elseif kind == "stopAnimation" then
+				self:_stopAllAnimations(true, tonumber(ev.transitionTime) or 0)
+
+			elseif kind == "playToolAnimation" then
+				self._toolAnimSignal = ev.signal or self._toolAnimSignal
+				self:_playToolAnimation(
+					ev.animName or "toolnone",
+					tonumber(ev.transitionTime) or 0,
+					self._humanoid :: Humanoid,
+					self:_parsePriority(ev.priority),
+					ev.animId,
+					true
+				)
+
+			elseif kind == "stopToolAnimation" then
+				self:_stopToolAnimations(true)
+
+			elseif kind == "tool_anim_signal" then
+				self._toolAnimSignal = ev.value or "None"
+
+			elseif kind == "session_stop" then
+				-- no-op, for audit only
+
+			elseif kind == "emote" then
+				-- no-op, because actual playback is driven by playAnimation events
+			end
+		end
+
+		if self._playToken == myToken then
+			self._playing = false
+			self:_setState("saved")
+
+			self:_disablePlaybackPhysics()
+			self:_stopToolAnimations(true)
+
+			if self._humanoid then
+				self:_playAnimation("idle", 0.1, self._humanoid)
+				self._pose = "Standing"
+			end
+		end
+	end)
+
+	return true
+end
+
+function Recorder:Reset()
+	self._playing = false
+	self._playToken += 1
+	self._stopActive = false
+
+	self:_disconnectAll()
+	self:_disablePlaybackPhysics()
+	self:_disableStopPhysics(false)
+	self:_stopAllAnimations(true, 0)
+	self:_stopToolAnimations(true)
+	self:_restoreDefaultAnimate()
+
+	self._character = nil
+	self._humanoid = nil
+	self._torso = nil
+	self._rootPart = nil
+	self._rightShoulder = nil
+	self._leftShoulder = nil
+	self._rightHip = nil
+	self._leftHip = nil
+	self._neck = nil
+	self._animator = nil
+
+	self._pose = "Standing"
+	self._toolAnimSignal = "None"
+	self._toolAnimTime = 0
+	self._simTime = 0
+	self._lastTick = 0
+	self._stopPreviewFrame = 1
+	self._stopPreviewTime = 0
+	self._stopResumeTruncateTime = nil
+	self:_clearSessionData()
+
+	self:_setState("idle")
+	return true
+end
+
+local singleton = Recorder.new()
+singleton:_setState("idle")
+return singleton
+
+	
+	-- ▲▲▲▲▲ 模塊代碼貼上區域結束 ▲▲▲▲▲
+	
+end)()
+
+-- =========================================================
+--[ 以下為 GUI 介面建構與按鈕控制邏輯 ]
+-- =========================================================
+
+if not RecorderModule then
+	warn("[AnimRecorderGUI] 尚未偵測到模塊回傳值！(請確認你已經將模塊代碼貼入上方的插槽中)")
+	-- 為了方便預覽 UI，這裡不 return 中斷，而是讓它顯示報錯 UI
+end
+
+-- 1. 創建 GUI 介面
+local ScreenGui = Instance.new("ScreenGui")
+ScreenGui.Name = "AnimRecorderGUI"
+ScreenGui.ResetOnSpawn = false
+ScreenGui.Parent = player:WaitForChild("PlayerGui")
+
+local MainFrame = Instance.new("Frame")
+MainFrame.Name = "MainFrame"
+MainFrame.Size = UDim2.new(0, 180, 0, 360)
+MainFrame.Position = UDim2.new(1, -190, 0.5, -180)
+MainFrame.BackgroundColor3 = Color3.fromRGB(35, 35, 40)
+MainFrame.BorderSizePixel = 0
+MainFrame.Parent = ScreenGui
+
+local UICorner = Instance.new("UICorner")
+UICorner.CornerRadius = UDim.new(0, 10)
+UICorner.Parent = MainFrame
+
+local UIListLayout = Instance.new("UIListLayout")
+UIListLayout.Parent = MainFrame
+UIListLayout.SortOrder = Enum.SortOrder.LayoutOrder
+UIListLayout.Padding = UDim.new(0, 8)
+UIListLayout.HorizontalAlignment = Enum.HorizontalAlignment.Center
+
+local UIPadding = Instance.new("UIPadding")
+UIPadding.Parent = MainFrame
+UIPadding.PaddingTop = UDim.new(0, 10)
+UIPadding.PaddingBottom = UDim.new(0, 10)
+
+-- 狀態文字標籤
+local StatusLabel = Instance.new("TextLabel")
+StatusLabel.Name = "StatusLabel"
+StatusLabel.Size = UDim2.new(1, -10, 0, 25)
+StatusLabel.BackgroundTransparency = 1
+StatusLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+StatusLabel.TextScaled = true
+StatusLabel.Font = Enum.Font.SourceSansBold
+StatusLabel.Text = "Status: INIT"
+StatusLabel.LayoutOrder = 1
+StatusLabel.Parent = MainFrame
+
+-- 建立共用按鈕
+local function createButton(name, text, order, parent, widthScale, widthOffset)
+	local btn = Instance.new("TextButton")
+	btn.Name = name
+	btn.Size = UDim2.new(widthScale or 1, widthOffset or -20, 0, 38)
+	btn.BackgroundColor3 = Color3.fromRGB(100, 100, 100)
+	btn.TextColor3 = Color3.fromRGB(255, 255, 255)
+	btn.Font = Enum.Font.SourceSansBold
+	btn.TextSize = 18
+	btn.Text = text
+	btn.LayoutOrder = order
+	btn.Parent = parent
+	
+	local corner = Instance.new("UICorner")
+	corner.CornerRadius = UDim.new(0, 6)
+	corner.Parent = btn
+	return btn
+end
+
+-- 創建各個按鈕
+local BtnRecord = createButton("BtnRecord", "⏺ Record", 2, MainFrame)
+local BtnStop   = createButton("BtnStop", "⏸ Pause", 3, MainFrame)
+
+-- 創建一個水平排列的 Frame 來放逐幀後退/前進按鈕
+local StepFrame = Instance.new("Frame")
+StepFrame.Name = "StepFrame"
+StepFrame.Size = UDim2.new(1, -20, 0, 38)
+StepFrame.BackgroundTransparency = 1
+StepFrame.LayoutOrder = 4
+StepFrame.Parent = MainFrame
+
+local StepLayout = Instance.new("UIListLayout")
+StepLayout.FillDirection = Enum.FillDirection.Horizontal
+StepLayout.SortOrder = Enum.SortOrder.LayoutOrder
+StepLayout.Padding = UDim.new(0, 5)
+StepLayout.Parent = StepFrame
+
+-- 寬度為 0.5 減去一半的 Padding (2.5) 以完美置中
+local BtnBack  = createButton("BtnBack", "⏪ -1F", 1, StepFrame, 0.5, -2.5)
+local BtnFront = createButton("BtnFront", "+1F ⏩", 2, StepFrame, 0.5, -2.5)
+
+local BtnSave  = createButton("BtnSave", "💾 Save", 5, MainFrame)
+local BtnPlay  = createButton("BtnPlay", "▶ Play", 6, MainFrame)
+local BtnReset = createButton("BtnReset", "🔄 Reset", 7, MainFrame)
+
+-- =========================================================
+-- 2. 動態按鈕視覺狀態邏輯
+-- =========================================================
+local function setButtonState(btn, isEnabled, activeColor, newText)
+	if newText then
+		btn.Text = newText
+	end
+	
+	btn.Interactable = isEnabled -- Roblox 內建，關閉後無法點擊且會有微微暗化
+	
+	if isEnabled then
+		btn.BackgroundColor3 = activeColor
+		btn.BackgroundTransparency = 0
+		btn.TextColor3 = Color3.fromRGB(255, 255, 255)
+	else
+		-- 視覺變灰暗
+		local h, s, v = Color3.toHSV(activeColor)
+		btn.BackgroundColor3 = Color3.fromHSV(h, s * 0.4, v * 0.4)
+		btn.BackgroundTransparency = 0.5
+		btn.TextColor3 = Color3.fromRGB(180, 180, 180)
+	end
+end
+
+-- =========================================================
+-- 3. 按鈕點擊事件 (串接最新 API)
+-- =========================================================
+local function safeCall(func, ...)
+	if not RecorderModule then return end
+	local ok, err = func(RecorderModule, ...)
+	if not ok and err then warn("[Recorder]:", err) end
+end
+
+BtnRecord.MouseButton1Click:Connect(function() safeCall(RecorderModule.Record) end)
+BtnStop.MouseButton1Click:Connect(function()   safeCall(RecorderModule.Stop) end)
+BtnBack.MouseButton1Click:Connect(function()   safeCall(RecorderModule.goBack, 1) end)
+BtnFront.MouseButton1Click:Connect(function()  safeCall(RecorderModule.goFront, 1) end)
+BtnSave.MouseButton1Click:Connect(function()   safeCall(RecorderModule.Save) end)
+BtnPlay.MouseButton1Click:Connect(function()   safeCall(RecorderModule.Play) end)
+BtnReset.MouseButton1Click:Connect(function()  safeCall(RecorderModule.Reset) end)
+
+-- =========================================================
+-- 4. 每幀刷新 UI 顯示
+-- =========================================================
+local COLORS = {
+	Record = Color3.fromRGB(220, 50, 50),
+	Stop   = Color3.fromRGB(200, 140, 40),
+	Step   = Color3.fromRGB(120, 100, 200),
+	Save   = Color3.fromRGB(50, 150, 220),
+	Play   = Color3.fromRGB(50, 200, 80),
+	Reset  = Color3.fromRGB(150, 150, 150),
+}
+
+RunService.RenderStepped:Connect(function()
+	if not RecorderModule or type(RecorderModule) ~= "table" then return end
+	
+	local state = RecorderModule:GetState() or "idle"
+	StatusLabel.Text = "State: " .. string.upper(state)
+	
+	-- 根據狀態切換各個按鈕的可點擊性與視覺顏色
+	if state == "idle" then
+		setButtonState(BtnRecord, true,  COLORS.Record, "⏺ Record")
+		setButtonState(BtnStop,   false, COLORS.Stop,   "⏸ Pause")
+		setButtonState(BtnBack,   false, COLORS.Step)
+		setButtonState(BtnFront,  false, COLORS.Step)
+		setButtonState(BtnSave,   false, COLORS.Save)
+		setButtonState(BtnPlay,   false, COLORS.Play)
+		setButtonState(BtnReset,  false, COLORS.Reset)
+		
+	elseif state == "recording" then
+		setButtonState(BtnRecord, false, COLORS.Record, "⏺ Recording...")
+		setButtonState(BtnStop,   true,  COLORS.Stop,   "⏸ Pause (Preview)")
+		setButtonState(BtnBack,   false, COLORS.Step)
+		setButtonState(BtnFront,  false, COLORS.Step)
+		setButtonState(BtnSave,   true,  COLORS.Save) -- 錄製中可直接 Save 結束
+		setButtonState(BtnPlay,   false, COLORS.Play)
+		setButtonState(BtnReset,  true,  COLORS.Reset)
+		
+	elseif state == "stopped" then -- Preview Mode (StopActive = true)
+		setButtonState(BtnRecord, false, COLORS.Record, "⏺ Record")
+		setButtonState(BtnStop,   true,  Color3.fromRGB(220, 180, 50), "▶ Resume Record")
+		setButtonState(BtnBack,   true,  COLORS.Step)
+		setButtonState(BtnFront,  true,  COLORS.Step)
+		setButtonState(BtnSave,   true,  COLORS.Save)
+		setButtonState(BtnPlay,   false, COLORS.Play)
+		setButtonState(BtnReset,  true,  COLORS.Reset)
+		
+	elseif state == "saved" then
+		setButtonState(BtnRecord, true,  COLORS.Record, "⏺ Re-Record")
+		setButtonState(BtnStop,   false, COLORS.Stop,   "⏸ Pause")
+		setButtonState(BtnBack,   false, COLORS.Step)
+		setButtonState(BtnFront,  false, COLORS.Step)
+		setButtonState(BtnSave,   false, COLORS.Save)
+		setButtonState(BtnPlay,   true,  COLORS.Play)
+		setButtonState(BtnReset,  true,  COLORS.Reset)
+		
+	elseif state == "playing" then
+		setButtonState(BtnRecord, false, COLORS.Record, "⏺ Record")
+		setButtonState(BtnStop,   true,  COLORS.Record, "⏹ Stop Playback") -- 播放時 Stop 的含義改變
+		setButtonState(BtnBack,   false, COLORS.Step)
+		setButtonState(BtnFront,  false, COLORS.Step)
+		setButtonState(BtnSave,   false, COLORS.Save)
+		setButtonState(BtnPlay,   false, COLORS.Play)
+		setButtonState(BtnReset,  true,  COLORS.Reset)
+	end
+end)
+
+-- =========================================================
+-- 5. 角色綁定邏輯
+-- =========================================================
+local function setupRecorder(character)
+	if RecorderModule and type(RecorderModule.Start) == "function" then
+		RecorderModule:Start(character)
+		print("[AnimRecorderGUI] Successfully bound to character:", character.Name)
+	end
+end
+
+if player.Character then
+	setupRecorder(player.Character)
+end
+
+player.CharacterAdded:Connect(function(character)
+	setupRecorder(character)
+end)
